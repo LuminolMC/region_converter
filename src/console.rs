@@ -8,7 +8,9 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
 use region_converter::convert::{
     JobFailure, JobReport, ProgressSnapshot, RunObserver, RunPlan, RunSummary,
 };
+use region_converter::discovery::InputKind;
 use region_converter::formats::RegionFormat;
+use region_converter::info::{FormatCount, InfoSummary, RegionInfoEntry};
 
 const BAR_WIDTH: usize = 28;
 const PROGRESS_REFRESH_HZ: u8 = 20;
@@ -21,6 +23,64 @@ pub struct ConsoleReporter {
 impl ConsoleReporter {
     pub fn new() -> Self {
         Self { progress: None }
+    }
+
+    pub fn print_info_summary(&mut self, summary: &InfoSummary) -> Result<()> {
+        println!("Save info:");
+        println!("  Inputs ({}):", summary.inputs.len());
+        for (input_index, input) in summary.inputs.iter().enumerate() {
+            println!("  - {} [{}]", input.input_path.display(), input.input_kind);
+            println!("    Region files: {}", input.region_files);
+            println!(
+                "    Readable regions: {} | Failed regions: {}",
+                input.readable_regions, input.failed_regions
+            );
+            println!(
+                "    Total size: {} ({} bytes)",
+                format_bytes(input.total_size_bytes),
+                input.total_size_bytes
+            );
+            println!(
+                "    Chunks ok: {} | Discarded chunks: {} | Warnings: {}",
+                input.chunk_count, input.discarded_chunks, input.warnings
+            );
+            println!(
+                "    Formats: {}",
+                format_format_breakdown(&input.format_breakdown)
+            );
+
+            if input.input_kind == InputKind::RegionFile {
+                if let Some(entry) = summary
+                    .entries
+                    .iter()
+                    .find(|entry| entry.input_index == input_index)
+                {
+                    print_single_region_details(entry);
+                }
+            }
+        }
+
+        println!("Overall:");
+        println!("  Threads used: {}", summary.thread_count);
+        println!("  Region files: {}", summary.total_region_files);
+        println!(
+            "  Readable regions: {} | Failed regions: {}",
+            summary.readable_regions, summary.failed_regions
+        );
+        println!(
+            "  Total size: {} ({} bytes)",
+            format_bytes(summary.total_size_bytes),
+            summary.total_size_bytes
+        );
+        println!(
+            "  Chunks ok: {} | Discarded chunks: {} | Warnings: {}",
+            summary.chunk_count, summary.discarded_chunks, summary.warnings
+        );
+        println!("  Completed in {}", format_duration(summary.elapsed));
+
+        print_info_issues(summary);
+        io::stdout().flush()?;
+        Ok(())
     }
 }
 
@@ -81,8 +141,9 @@ impl RunObserver for ConsoleReporter {
         }
 
         println!(
-            "Completed in {}. Success: {}. Failed: {}. Chunks written: {}. Discarded chunks: {}. Warnings: {}.",
+            "Completed in {}. Average: {:.1} chunk/s. Success: {}. Failed: {}. Chunks written: {}. Discarded chunks: {}. Warnings: {}.",
             format_duration(summary.elapsed),
+            average_chunk_rate(summary.total_chunks_written, summary.elapsed),
             summary.successful_jobs,
             summary.failed_jobs,
             summary.total_chunks_written,
@@ -128,6 +189,23 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+
+    let mut value = bytes as f64;
+    let mut unit_index = 0;
+    while value >= 1024.0 && unit_index + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit_index += 1;
+    }
+
+    if unit_index == 0 {
+        format!("{bytes} {}", UNITS[unit_index])
+    } else {
+        format!("{value:.2} {}", UNITS[unit_index])
+    }
+}
+
 fn render_progress_stats(snapshot: &ProgressSnapshot) -> String {
     format!(
         "chunks ok {} discarded {} warn {} | {:.1} chunk/s",
@@ -136,6 +214,80 @@ fn render_progress_stats(snapshot: &ProgressSnapshot) -> String {
         snapshot.warnings,
         snapshot.chunk_rate_per_second(),
     )
+}
+
+fn average_chunk_rate(chunks: usize, elapsed: Duration) -> f64 {
+    let elapsed_secs = elapsed.as_secs_f64();
+    if elapsed_secs <= 0.0 {
+        0.0
+    } else {
+        chunks as f64 / elapsed_secs
+    }
+}
+
+fn format_format_breakdown(formats: &[FormatCount]) -> String {
+    if formats.is_empty() {
+        return "unknown".to_string();
+    }
+
+    formats
+        .iter()
+        .map(|entry| format!("{} x{}", entry.format, entry.count))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn print_single_region_details(entry: &RegionInfoEntry) {
+    if let Some(format) = entry.storage_format {
+        println!("    Format: {}", format);
+    }
+
+    if let (Some(region_x), Some(region_z)) = (entry.region_x, entry.region_z) {
+        println!("    Region coords: ({region_x}, {region_z})");
+    }
+
+    if let Some(size_bytes) = entry.size_bytes {
+        println!(
+            "    File size: {} ({} bytes)",
+            format_bytes(size_bytes),
+            size_bytes
+        );
+    }
+
+    if let Some(error) = &entry.error {
+        println!("    Status: failed");
+        println!("    Error: {error}");
+    }
+}
+
+fn print_info_issues(summary: &InfoSummary) {
+    let warning_entries = summary
+        .entries
+        .iter()
+        .filter(|entry| !entry.warnings.is_empty())
+        .collect::<Vec<_>>();
+    if !warning_entries.is_empty() {
+        println!("Warnings:");
+        for entry in warning_entries {
+            for warning in &entry.warnings {
+                println!("  - [{}] {}", entry.source_file.display(), warning);
+            }
+        }
+    }
+
+    let error_entries = summary
+        .entries
+        .iter()
+        .filter(|entry| entry.error.is_some())
+        .collect::<Vec<_>>();
+    if !error_entries.is_empty() {
+        println!("Errors:");
+        for entry in error_entries {
+            if let Some(error) = &entry.error {
+                println!("  - [{}] {}", entry.source_file.display(), error);
+            }
+        }
+    }
 }
 
 fn draw_target() -> ProgressDrawTarget {
@@ -206,5 +358,10 @@ mod tests {
             render_progress_stats(&snapshot),
             "chunks ok 485 discarded 0 warn 0 | 1107.3 chunk/s"
         );
+    }
+
+    #[test]
+    fn average_chunk_rate_is_derived_from_elapsed_time() {
+        assert_eq!(average_chunk_rate(2004, Duration::from_secs(10)), 200.4);
     }
 }

@@ -9,6 +9,7 @@ use region_converter::cli::{Cli, SourceFormatArg, TargetFormatArg};
 use region_converter::convert::run;
 use region_converter::discovery::discover_jobs;
 use region_converter::formats::{RegionFormat, encode_region};
+use region_converter::info::inspect;
 use region_converter::model::{ChunkData, Region};
 
 fn reference_path(relative: &str) -> PathBuf {
@@ -52,6 +53,23 @@ fn pseudo_random_bytes(len: usize) -> Vec<u8> {
     bytes
 }
 
+fn conversion_cli(
+    inputs: Vec<PathBuf>,
+    output: PathBuf,
+    from: SourceFormatArg,
+    to: TargetFormatArg,
+) -> Cli {
+    Cli {
+        inputs,
+        output: Some(output),
+        info: false,
+        from,
+        to: Some(to),
+        threads: Some(1),
+        compression_level: None,
+    }
+}
+
 #[test]
 fn auto_detection_defers_corrupt_blinear_failures_to_job_execution() -> Result<()> {
     let temp_dir = tempdir()?;
@@ -65,14 +83,12 @@ fn auto_detection_defers_corrupt_blinear_failures_to_job_execution() -> Result<(
     fs::create_dir_all(&input_dir)?;
     fs::write(input_dir.join("r.0.0.b_linear"), [0_u8, 1, 2, 3])?;
 
-    let summary = run(Cli {
-        inputs: vec![input_dir],
-        output: output_dir,
-        from: SourceFormatArg::Auto,
-        to: TargetFormatArg::Linear,
-        threads: Some(1),
-        compression_level: None,
-    })?;
+    let summary = run(conversion_cli(
+        vec![input_dir],
+        output_dir,
+        SourceFormatArg::Auto,
+        TargetFormatArg::Linear,
+    ))?;
 
     assert_eq!(summary.total_jobs, 2);
     assert_eq!(summary.successful_jobs, 1);
@@ -99,6 +115,13 @@ fn discovery_skips_preexisting_output_trees() -> Result<()> {
 
     assert_eq!(jobs.len(), 1);
     assert!(jobs[0].source_file.ends_with("region/r.-1.-1.mca"));
+    assert!(
+        jobs[0]
+            .destination_file
+            .to_string_lossy()
+            .contains("/out/world__")
+    );
+    assert!(jobs[0].destination_file.ends_with("region/r.-1.-1.linear"));
     Ok(())
 }
 
@@ -119,7 +142,7 @@ fn multi_input_mounts_do_not_collide_when_trailing_paths_match() -> Result<()> {
     )?;
 
     let jobs = discover_jobs(
-        &[input_a, input_b],
+        &[input_a.clone(), input_b.clone()],
         &output_root,
         Some(RegionFormat::Mca),
         RegionFormat::Linear,
@@ -131,6 +154,41 @@ fn multi_input_mounts_do_not_collide_when_trailing_paths_match() -> Result<()> {
         .map(|job| job.destination_file.clone())
         .collect::<HashSet<_>>();
     assert_eq!(destinations.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn directory_mounts_remain_unique_across_separate_runs() -> Result<()> {
+    let temp_dir = tempdir()?;
+    let input_a = temp_dir.path().join("a/world");
+    let input_b = temp_dir.path().join("b/world");
+    let output_root = temp_dir.path().join("output");
+
+    copy_reference_file(
+        "reference/minecraft_world_trimmer_mca/test_files/r.-1.-1.mca",
+        &input_a.join("region/r.-1.-1.mca"),
+    )?;
+    copy_reference_file(
+        "reference/minecraft_world_trimmer_mca/test_files/r.-1.-1.mca",
+        &input_b.join("region/r.-1.-1.mca"),
+    )?;
+
+    let jobs_a = discover_jobs(
+        std::slice::from_ref(&input_a),
+        &output_root,
+        Some(RegionFormat::Mca),
+        RegionFormat::Linear,
+    )?;
+    let jobs_b = discover_jobs(
+        std::slice::from_ref(&input_b),
+        &output_root,
+        Some(RegionFormat::Mca),
+        RegionFormat::Linear,
+    )?;
+
+    assert_eq!(jobs_a.len(), 1);
+    assert_eq!(jobs_b.len(), 1);
+    assert_ne!(jobs_a[0].destination_file, jobs_b[0].destination_file);
     Ok(())
 }
 
@@ -152,35 +210,49 @@ fn mca_overwrite_is_rejected_when_existing_destination_uses_external_sidecars() 
     assert!(!encoded.sidecar_files.is_empty());
 
     write_encoded_region(&input_dir, "r.0.0.mca", &encoded)?;
-    write_encoded_region(&output_dir, "r.0.0.mca", &encoded)?;
+    let mapped_output_dir = discover_jobs(
+        std::slice::from_ref(&input_dir),
+        &output_dir,
+        Some(RegionFormat::Mca),
+        RegionFormat::Mca,
+    )?[0]
+        .destination_file
+        .parent()
+        .expect("discovered destination should have a parent")
+        .to_path_buf();
+    write_encoded_region(&mapped_output_dir, "r.0.0.mca", &encoded)?;
 
-    let original_main = fs::read(output_dir.join("r.0.0.mca"))?;
+    let original_main = fs::read(mapped_output_dir.join("r.0.0.mca"))?;
     let original_sidecars = encoded
         .sidecar_files
         .iter()
         .map(|sidecar| {
             Ok::<_, anyhow::Error>((
                 sidecar.file_name.clone(),
-                fs::read(output_dir.join(&sidecar.file_name))?,
+                fs::read(mapped_output_dir.join(&sidecar.file_name))?,
             ))
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let summary = run(Cli {
-        inputs: vec![input_dir],
-        output: output_dir.clone(),
-        from: SourceFormatArg::Mca,
-        to: TargetFormatArg::Mca,
-        threads: Some(1),
-        compression_level: Some(6),
-    })?;
+    let mut cli = conversion_cli(
+        vec![input_dir],
+        output_dir.clone(),
+        SourceFormatArg::Mca,
+        TargetFormatArg::Mca,
+    );
+    cli.compression_level = Some(6);
+
+    let summary = run(cli)?;
 
     assert_eq!(summary.total_jobs, 1);
     assert_eq!(summary.successful_jobs, 0);
     assert_eq!(summary.failed_jobs, 1);
-    assert_eq!(fs::read(output_dir.join("r.0.0.mca"))?, original_main);
+    assert_eq!(
+        fs::read(mapped_output_dir.join("r.0.0.mca"))?,
+        original_main
+    );
     for (file_name, original_bytes) in original_sidecars {
-        assert_eq!(fs::read(output_dir.join(file_name))?, original_bytes);
+        assert_eq!(fs::read(mapped_output_dir.join(file_name))?, original_bytes);
     }
     Ok(())
 }
@@ -196,16 +268,102 @@ fn worker_threads_are_capped_to_discovered_region_files() -> Result<()> {
         &input_dir.join("r.-1.-1.mca"),
     )?;
 
-    let summary = run(Cli {
-        inputs: vec![input_dir],
-        output: output_dir,
-        from: SourceFormatArg::Mca,
-        to: TargetFormatArg::Linear,
-        threads: Some(64),
-        compression_level: None,
-    })?;
+    let mut cli = conversion_cli(
+        vec![input_dir],
+        output_dir,
+        SourceFormatArg::Mca,
+        TargetFormatArg::Linear,
+    );
+    cli.threads = Some(64);
+
+    let summary = run(cli)?;
 
     assert_eq!(summary.total_jobs, 1);
     assert_eq!(summary.thread_count, 1);
+    Ok(())
+}
+
+#[test]
+fn single_region_file_inputs_write_directly_under_output_root() -> Result<()> {
+    let temp_dir = tempdir()?;
+    let input_file = temp_dir.path().join("r.-1.-1.mca");
+    let output_root = temp_dir.path().join("output");
+
+    copy_reference_file(
+        "reference/minecraft_world_trimmer_mca/test_files/r.-1.-1.mca",
+        &input_file,
+    )?;
+
+    let jobs = discover_jobs(
+        &[input_file.clone()],
+        &output_root,
+        Some(RegionFormat::Mca),
+        RegionFormat::Linear,
+    )?;
+
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].source_file, input_file);
+    assert_eq!(jobs[0].destination_file, output_root.join("r.-1.-1.linear"));
+    Ok(())
+}
+
+#[test]
+fn info_mode_reports_single_region_file_details() -> Result<()> {
+    let temp_dir = tempdir()?;
+    let input_file = temp_dir.path().join("r.-1.-1.mca");
+
+    copy_reference_file(
+        "reference/minecraft_world_trimmer_mca/test_files/r.-1.-1.mca",
+        &input_file,
+    )?;
+
+    let summary = inspect(Cli {
+        inputs: vec![input_file.clone()],
+        output: None,
+        info: true,
+        from: SourceFormatArg::Auto,
+        to: None,
+        threads: Some(1),
+        compression_level: None,
+    })?;
+
+    assert_eq!(summary.total_region_files, 1);
+    assert_eq!(summary.readable_regions, 1);
+    assert_eq!(summary.failed_regions, 0);
+    assert_eq!(summary.inputs.len(), 1);
+    assert_eq!(summary.inputs[0].input_path, input_file);
+    assert_eq!(summary.inputs[0].region_files, 1);
+    assert!(summary.chunk_count > 0);
+    assert_eq!(
+        summary.entries[0]
+            .storage_format
+            .map(|format| format.to_string()),
+        Some("mca".to_string())
+    );
+    Ok(())
+}
+
+#[test]
+fn info_mode_counts_unreadable_file_sizes_in_totals() -> Result<()> {
+    let temp_dir = tempdir()?;
+    let input_file = temp_dir.path().join("r.0.0.linear");
+    fs::write(&input_file, [0_u8, 1, 2, 3])?;
+
+    let summary = inspect(Cli {
+        inputs: vec![input_file.clone()],
+        output: None,
+        info: true,
+        from: SourceFormatArg::Auto,
+        to: None,
+        threads: Some(1),
+        compression_level: None,
+    })?;
+
+    assert_eq!(summary.total_region_files, 1);
+    assert_eq!(summary.readable_regions, 0);
+    assert_eq!(summary.failed_regions, 1);
+    assert_eq!(summary.total_size_bytes, 4);
+    assert_eq!(summary.inputs[0].total_size_bytes, 4);
+    assert_eq!(summary.entries[0].size_bytes, Some(4));
     Ok(())
 }

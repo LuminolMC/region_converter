@@ -10,6 +10,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
 use xxhash_rust::xxh32::xxh32;
+use xxhash_rust::xxh64::xxh64;
 
 use crate::model::{ChunkData, Region};
 
@@ -22,6 +23,16 @@ pub enum RegionFormat {
     Mca,
     Linear,
     Blinear,
+    BlinearV2,
+    BlinearV3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum RegionStorageFormat {
+    Mca,
+    LinearV1,
+    LinearV2,
+    LinearV3,
     BlinearV2,
     BlinearV3,
 }
@@ -67,12 +78,36 @@ impl RegionFormat {
     }
 }
 
+impl RegionStorageFormat {
+    pub fn family(self) -> RegionFormat {
+        match self {
+            Self::Mca => RegionFormat::Mca,
+            Self::LinearV1 | Self::LinearV2 | Self::LinearV3 => RegionFormat::Linear,
+            Self::BlinearV2 => RegionFormat::BlinearV2,
+            Self::BlinearV3 => RegionFormat::BlinearV3,
+        }
+    }
+}
+
 impl Display for RegionFormat {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Mca => f.write_str("mca"),
             Self::Linear => f.write_str("linear"),
             Self::Blinear => f.write_str("blinear"),
+            Self::BlinearV2 => f.write_str("blinear_v2"),
+            Self::BlinearV3 => f.write_str("blinear_v3"),
+        }
+    }
+}
+
+impl Display for RegionStorageFormat {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mca => f.write_str("mca"),
+            Self::LinearV1 => f.write_str("linear_v1"),
+            Self::LinearV2 => f.write_str("linear_v2"),
+            Self::LinearV3 => f.write_str("linear_v3"),
             Self::BlinearV2 => f.write_str("blinear_v2"),
             Self::BlinearV3 => f.write_str("blinear_v3"),
         }
@@ -89,9 +124,13 @@ pub fn guess_format_from_path(path: &Path) -> Result<RegionFormat> {
 }
 
 pub fn detect_format(path: &Path) -> Result<RegionFormat> {
+    Ok(detect_storage_format(path)?.family())
+}
+
+pub fn detect_storage_format(path: &Path) -> Result<RegionStorageFormat> {
     match path.extension().and_then(|ext| ext.to_str()) {
-        Some("mca") => Ok(RegionFormat::Mca),
-        Some("linear") => Ok(RegionFormat::Linear),
+        Some("mca") => Ok(RegionStorageFormat::Mca),
+        Some("linear") => linear::detect_storage_format(path),
         Some("b_linear") => detect_blinear_format(path),
         _ => bail!("unsupported region file extension for {}", path.display()),
     }
@@ -99,6 +138,20 @@ pub fn detect_format(path: &Path) -> Result<RegionFormat> {
 
 pub fn region_uses_external_chunks(path: &Path) -> Result<bool> {
     mca::region_uses_external_chunks(path)
+}
+
+pub fn region_storage_size(path: &Path, format: RegionStorageFormat) -> Result<u64> {
+    match format {
+        RegionStorageFormat::Mca => mca::storage_size(path),
+        RegionStorageFormat::LinearV1
+        | RegionStorageFormat::LinearV2
+        | RegionStorageFormat::LinearV3
+        | RegionStorageFormat::BlinearV2
+        | RegionStorageFormat::BlinearV3 => Ok(path
+            .metadata()
+            .with_context(|| format!("failed to read metadata for {}", path.display()))?
+            .len()),
+    }
 }
 
 pub fn read_region(path: &Path, format: RegionFormat) -> Result<ReadOutcome> {
@@ -231,7 +284,11 @@ pub(crate) fn xxhash32(seed: u32, bytes: &[u8]) -> u32 {
     xxh32(bytes, seed)
 }
 
-fn detect_blinear_format(path: &Path) -> Result<RegionFormat> {
+pub(crate) fn xxhash64(seed: u64, bytes: &[u8]) -> u64 {
+    xxh64(bytes, seed)
+}
+
+fn detect_blinear_format(path: &Path) -> Result<RegionStorageFormat> {
     let mut header = [0_u8; 9];
     let mut file =
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
@@ -246,8 +303,8 @@ fn detect_blinear_format(path: &Path) -> Result<RegionFormat> {
     );
 
     match header[8] {
-        0x02 => Ok(RegionFormat::BlinearV2),
-        0x03 => Ok(RegionFormat::BlinearV3),
+        0x02 => Ok(RegionStorageFormat::BlinearV2),
+        0x03 => Ok(RegionStorageFormat::BlinearV3),
         version => bail!(
             "unsupported blinear version {version} in {}",
             path.display()

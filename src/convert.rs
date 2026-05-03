@@ -108,12 +108,17 @@ pub fn run(cli: Cli) -> Result<RunSummary> {
 }
 
 pub fn run_with_observer(cli: Cli, observer: &mut dyn RunObserver) -> Result<RunSummary> {
+    cli.validate()?;
     let requested_thread_count = cli.thread_count()?;
     let source_format = cli.forced_source_format();
-    let target_format = cli.target_format();
+    let target_format = cli.target_format()?;
     let compression_level = cli.resolved_compression_level()?;
-    let discovery =
-        discover_jobs_with_summary(&cli.inputs, &cli.output, source_format, target_format)?;
+    let discovery = discover_jobs_with_summary(
+        &cli.inputs,
+        cli.output_root()?,
+        source_format,
+        target_format,
+    )?;
     let thread_count = requested_thread_count.min(discovery.jobs.len().max(1));
 
     let plan = build_run_plan(
@@ -236,7 +241,10 @@ fn build_run_plan(
 ) -> RunPlan {
     RunPlan {
         input_paths: cli.inputs.clone(),
-        output_root: cli.output.clone(),
+        output_root: cli
+            .output
+            .clone()
+            .expect("conversion mode should always have an output root"),
         source_format,
         requested_thread_count,
         target_format,

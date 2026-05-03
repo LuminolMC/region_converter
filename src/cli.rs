@@ -1,6 +1,6 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 
 use crate::formats::RegionFormat;
@@ -9,24 +9,24 @@ use crate::formats::RegionFormat;
 #[command(
     author,
     version,
-    about = "Convert Minecraft Java region files between mca, linear, blinear_v2, and blinear_v3."
+    about = "Convert or inspect Minecraft Java region saves across mca, linear, blinear_v2, and blinear_v3."
 )]
 pub struct Cli {
     #[arg(
         value_name = "INPUT",
         required = true,
-        help = "Input world directories or region directories."
+        help = "Input world directories, region directories, or individual region files."
     )]
     pub inputs: Vec<PathBuf>,
 
+    #[arg(short, long, value_name = "PATH", help = "Output root path.")]
+    pub output: Option<PathBuf>,
+
     #[arg(
-        short,
         long,
-        value_name = "PATH",
-        required = true,
-        help = "Output root path."
+        help = "Read the input save(s) and print detailed info without converting."
     )]
-    pub output: PathBuf,
+    pub info: bool,
 
     #[arg(
         long,
@@ -37,7 +37,7 @@ pub struct Cli {
     pub from: SourceFormatArg,
 
     #[arg(long, value_enum, help = "Target format.")]
-    pub to: TargetFormatArg,
+    pub to: Option<TargetFormatArg>,
 
     #[arg(
         long,
@@ -72,6 +72,33 @@ pub enum TargetFormatArg {
 }
 
 impl Cli {
+    pub fn validate(&self) -> Result<()> {
+        if self.info {
+            if self.output.is_some() {
+                bail!("--output cannot be used together with --info");
+            }
+            if self.to.is_some() {
+                bail!("--to cannot be used together with --info");
+            }
+            if self.compression_level.is_some() {
+                bail!("--compression-level cannot be used together with --info");
+            }
+            if self.from != SourceFormatArg::Auto {
+                bail!("--from cannot be used together with --info");
+            }
+            return Ok(());
+        }
+
+        if self.output.is_none() {
+            bail!("--output is required unless --info is used");
+        }
+        if self.to.is_none() {
+            bail!("--to is required unless --info is used");
+        }
+
+        Ok(())
+    }
+
     pub fn thread_count(&self) -> Result<usize> {
         match self.threads {
             Some(0) => bail!("thread count must be greater than zero"),
@@ -86,12 +113,20 @@ impl Cli {
         self.from.into_region_format()
     }
 
-    pub fn target_format(&self) -> RegionFormat {
-        self.to.into_region_format()
+    pub fn output_root(&self) -> Result<&Path> {
+        self.output
+            .as_deref()
+            .context("output root is only available in conversion mode")
+    }
+
+    pub fn target_format(&self) -> Result<RegionFormat> {
+        self.to
+            .map(TargetFormatArg::into_region_format)
+            .context("target format is only available in conversion mode")
     }
 
     pub fn resolved_compression_level(&self) -> Result<i32> {
-        let target = self.target_format();
+        let target = self.target_format()?;
         let level = self
             .compression_level
             .unwrap_or_else(|| target.default_compression_level());

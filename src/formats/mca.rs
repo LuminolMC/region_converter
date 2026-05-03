@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -160,6 +161,64 @@ pub fn region_uses_external_chunks(path: &Path) -> Result<bool> {
     }
 
     Ok(false)
+}
+
+pub fn storage_size(path: &Path) -> Result<u64> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    ensure!(
+        bytes.len() >= MCA_HEADER_SIZE,
+        "mca region {} is smaller than the 8 KiB header",
+        path.display()
+    );
+
+    let mut total_size = bytes.len() as u64;
+    let mut seen_sidecars = HashSet::new();
+    let (region_x, region_z) = parse_region_coords_from_path(path)?;
+    let parent = path
+        .parent()
+        .context("mca region file is missing a parent directory")?;
+
+    for index in 0..REGION_CHUNK_COUNT {
+        let location_offset = index * 4;
+        let location = u32::from_be_bytes(
+            bytes[location_offset..location_offset + 4]
+                .try_into()
+                .unwrap(),
+        );
+
+        let sector_index = ((location >> 8) & 0x00ff_ffff) as usize;
+        let sector_count = (location & 0xff) as usize;
+        if sector_index == 0 || sector_count == 0 {
+            continue;
+        }
+
+        let chunk_offset = sector_index * MCA_SECTOR_SIZE;
+        if chunk_offset + 5 > bytes.len() {
+            continue;
+        }
+
+        if bytes[chunk_offset + 4] & MCA_EXTERNAL_FLAG == 0 {
+            continue;
+        }
+
+        let local_x = index % REGION_SIDE;
+        let local_z = index / REGION_SIDE;
+        let chunk_x = region_x * REGION_SIDE as i32 + local_x as i32;
+        let chunk_z = region_z * REGION_SIDE as i32 + local_z as i32;
+        let sidecar_name = external_chunk_file_name(chunk_x, chunk_z);
+
+        if !seen_sidecars.insert(sidecar_name.clone()) {
+            continue;
+        }
+
+        let sidecar_path = parent.join(sidecar_name);
+        if let Ok(metadata) = sidecar_path.metadata() {
+            total_size += metadata.len();
+        }
+    }
+
+    Ok(total_size)
 }
 
 pub fn encode_region(region: &Region, compression_level: i32) -> Result<EncodedRegion> {
