@@ -1,4 +1,5 @@
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufReader, Read};
 use std::path::Path;
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,6 +9,25 @@ use anyhow::{Context, Result};
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temp_path = prepare_atomic_write(path, bytes)?;
+    commit_prepared_file(&temp_path, path)
+}
+
+pub fn read_file_bytes(path: &Path) -> Result<Vec<u8>> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let capacity = file
+        .metadata()
+        .map(|metadata| metadata.len() as usize)
+        .unwrap_or(0);
+    let mut reader = BufReader::new(file);
+    let mut bytes = Vec::with_capacity(capacity);
+    reader
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(bytes)
+}
+
+pub fn prepare_atomic_write(path: &Path, bytes: &[u8]) -> Result<std::path::PathBuf> {
     let parent = path
         .parent()
         .context("output file does not have a parent directory")?;
@@ -24,10 +44,10 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::write(&temp_path, bytes)
         .with_context(|| format!("failed to write temporary file {}", temp_path.display()))?;
 
-    replace_file(&temp_path, path)
+    Ok(temp_path)
 }
 
-fn replace_file(source: &Path, destination: &Path) -> Result<()> {
+pub fn commit_prepared_file(source: &Path, destination: &Path) -> Result<()> {
     match fs::rename(source, destination) {
         Ok(()) => Ok(()),
         Err(rename_error) => {
@@ -54,4 +74,8 @@ fn replace_file(source: &Path, destination: &Path) -> Result<()> {
             }
         }
     }
+}
+
+pub fn discard_prepared_file(path: &Path) {
+    let _ = fs::remove_file(path);
 }

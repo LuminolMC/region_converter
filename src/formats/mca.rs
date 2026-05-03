@@ -8,10 +8,12 @@ use flate2::Compression;
 use flate2::read::{GzDecoder, ZlibDecoder};
 use flate2::write::ZlibEncoder;
 
+use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::formats::{
     EncodedRegion, ReadOutcome, SidecarFile, normalize_timestamp_to_u32,
     parse_region_coords_from_path,
 };
+use crate::io_util::read_file_bytes;
 use crate::model::{ChunkData, REGION_CHUNK_COUNT, REGION_SIDE, Region};
 
 const MCA_HEADER_SIZE: usize = 8192;
@@ -23,8 +25,7 @@ const MCA_EXTERNAL_ZLIB: u8 = MCA_EXTERNAL_FLAG | MCA_COMPRESSION_ZLIB;
 const MAX_INLINE_SECTORS: usize = 255;
 
 pub fn read_region(path: &Path) -> Result<ReadOutcome> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let bytes = read_file_bytes(path)?;
     ensure!(
         bytes.len() >= MCA_HEADER_SIZE,
         "mca region {} is smaller than the 8 KiB header",
@@ -33,7 +34,7 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
 
     let (region_x, region_z) = parse_region_coords_from_path(path)?;
     let mut region = Region::new(region_x, region_z);
-    let mut warnings = Vec::new();
+    let mut diagnostics = Vec::new();
     let mut discarded_chunks = 0;
 
     for index in 0..REGION_CHUNK_COUNT {
@@ -58,13 +59,17 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
             continue;
         }
 
-        let chunk_label = format!("chunk slot {index} in {}", path.display());
-
         if sector_index == 0 || sector_count == 0 {
             discarded_chunks += 1;
-            warnings.push(format!(
-                "{chunk_label} has an invalid sector pointer and was skipped"
-            ));
+            diagnostics.push(
+                Diagnostic::warning(
+                    DiagnosticCode::InvalidMetadata,
+                    "chunk has an invalid sector pointer and was skipped",
+                )
+                .with_path(path)
+                .with_region_coords(region_x, region_z)
+                .with_chunk_index(index),
+            );
             continue;
         }
 
@@ -72,9 +77,15 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
         let chunk_limit = chunk_offset + sector_count * MCA_SECTOR_SIZE;
         if chunk_limit > bytes.len() || chunk_offset + 5 > bytes.len() {
             discarded_chunks += 1;
-            warnings.push(format!(
-                "{chunk_label} points outside the region file and was skipped"
-            ));
+            diagnostics.push(
+                Diagnostic::warning(
+                    DiagnosticCode::SkippedData,
+                    "chunk points outside the region file and was skipped",
+                )
+                .with_path(path)
+                .with_region_coords(region_x, region_z)
+                .with_chunk_index(index),
+            );
             continue;
         }
 
@@ -96,18 +107,30 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
             Ok(raw_nbt) => raw_nbt,
             Err(error) => {
                 discarded_chunks += 1;
-                warnings.push(format!(
-                    "{chunk_label} is corrupted and was skipped: {error:#}"
-                ));
+                diagnostics.push(
+                    Diagnostic::warning(
+                        DiagnosticCode::CorruptChunk,
+                        format!("chunk is corrupted and was skipped: {error:#}"),
+                    )
+                    .with_path(path)
+                    .with_region_coords(region_x, region_z)
+                    .with_chunk_index(index),
+                );
                 continue;
             }
         };
 
         if raw_nbt.is_empty() {
             discarded_chunks += 1;
-            warnings.push(format!(
-                "{chunk_label} decompressed to an empty payload and was skipped"
-            ));
+            diagnostics.push(
+                Diagnostic::warning(
+                    DiagnosticCode::SkippedData,
+                    "chunk decompressed to an empty payload and was skipped",
+                )
+                .with_path(path)
+                .with_region_coords(region_x, region_z)
+                .with_chunk_index(index),
+            );
             continue;
         }
 
@@ -122,14 +145,13 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
 
     Ok(ReadOutcome {
         region,
-        warnings,
+        diagnostics,
         discarded_chunks,
     })
 }
 
 pub fn region_uses_external_chunks(path: &Path) -> Result<bool> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let bytes = read_file_bytes(path)?;
     ensure!(
         bytes.len() >= MCA_HEADER_SIZE,
         "mca region {} is smaller than the 8 KiB header",
@@ -164,8 +186,7 @@ pub fn region_uses_external_chunks(path: &Path) -> Result<bool> {
 }
 
 pub fn storage_size(path: &Path) -> Result<u64> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let bytes = read_file_bytes(path)?;
     ensure!(
         bytes.len() >= MCA_HEADER_SIZE,
         "mca region {} is smaller than the 8 KiB header",
@@ -287,7 +308,7 @@ pub fn encode_region(region: &Region, compression_level: i32) -> Result<EncodedR
     Ok(EncodedRegion {
         main_file_bytes,
         sidecar_files,
-        warnings: Vec::new(),
+        diagnostics: Vec::new(),
     })
 }
 
@@ -312,12 +333,7 @@ fn decode_chunk_payload(
             .parent()
             .context("mca region file is missing a parent directory")?;
         let external_path = parent.join(external_chunk_file_name(chunk_x, chunk_z));
-        std::fs::read(&external_path).with_context(|| {
-            format!(
-                "failed to read external chunk file {}",
-                external_path.display()
-            )
-        })?
+        read_file_bytes(&external_path)?
     } else {
         ensure!(chunk_len >= 1, "chunk length is too short");
         let payload_start = chunk_offset + 5;

@@ -4,17 +4,22 @@ use std::path::Path;
 use anyhow::{Context, Result, ensure};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
+use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::formats::{
     BLINEAR_HASH_SEED, BLINEAR_SUPERBLOCK, EncodedRegion, ReadOutcome, decode_chunk_section,
     encode_chunk_section, parse_region_coords_from_path,
 };
+use crate::io_util::read_file_bytes;
 use crate::model::{REGION_CHUNK_COUNT, Region};
 
 const HEADER_SIZE: usize = 18;
 
 pub fn read_region(path: &Path) -> Result<ReadOutcome> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let bytes = read_file_bytes(path)?;
+    read_region_bytes(path, &bytes)
+}
+
+pub(crate) fn read_region_bytes(path: &Path, bytes: &[u8]) -> Result<ReadOutcome> {
     ensure!(
         bytes.len() >= HEADER_SIZE,
         "blinear_v2 region {} is too small",
@@ -42,7 +47,7 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
         .with_context(|| format!("failed to decompress {}", path.display()))?;
 
     let mut region = Region::new(region_x, region_z);
-    let mut warnings = Vec::new();
+    let mut diagnostics = Vec::new();
     let mut discarded_chunks = 0;
     let mut offset = 0_usize;
 
@@ -67,10 +72,15 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
 
         let section_len = section_len as usize;
         if offset + section_len > decompressed.len() {
-            warnings.push(format!(
-                "chunk slot {index} in {} points past the decompressed buffer and was skipped",
-                path.display()
-            ));
+            diagnostics.push(
+                Diagnostic::warning(
+                    DiagnosticCode::SkippedData,
+                    "chunk points past the decompressed buffer and was skipped",
+                )
+                .with_path(path)
+                .with_region_coords(region_x, region_z)
+                .with_chunk_index(index),
+            );
             discarded_chunks += 1;
             break;
         }
@@ -81,10 +91,15 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
         match decode_chunk_section(section, BLINEAR_HASH_SEED) {
             Ok(chunk) => region.set_chunk(index, chunk)?,
             Err(error) => {
-                warnings.push(format!(
-                    "chunk slot {index} in {} is corrupted and was skipped: {error:#}",
-                    path.display()
-                ));
+                diagnostics.push(
+                    Diagnostic::warning(
+                        DiagnosticCode::CorruptChunk,
+                        format!("chunk is corrupted and was skipped: {error:#}"),
+                    )
+                    .with_path(path)
+                    .with_region_coords(region_x, region_z)
+                    .with_chunk_index(index),
+                );
                 discarded_chunks += 1;
             }
         }
@@ -98,7 +113,7 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
 
     Ok(ReadOutcome {
         region,
-        warnings,
+        diagnostics,
         discarded_chunks,
     })
 }
@@ -131,6 +146,6 @@ pub fn encode_region(region: &Region, compression_level: i32) -> Result<EncodedR
     Ok(EncodedRegion {
         main_file_bytes,
         sidecar_files: Vec::new(),
-        warnings: Vec::new(),
+        diagnostics: Vec::new(),
     })
 }

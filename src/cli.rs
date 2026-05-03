@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 
-use crate::formats::RegionFormat;
+use crate::formats::{RegionFormat, SourceFormatHint};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -109,8 +109,8 @@ impl Cli {
         }
     }
 
-    pub fn forced_source_format(&self) -> Option<RegionFormat> {
-        self.from.into_region_format()
+    pub fn forced_source_format(&self) -> Option<SourceFormatHint> {
+        self.from.into_source_format_hint()
     }
 
     pub fn output_root(&self) -> Result<&Path> {
@@ -137,9 +137,6 @@ impl Cli {
                     bail!("mca compression level must be in the range 0..=9");
                 }
             }
-            RegionFormat::Blinear => {
-                bail!("generic blinear placeholder cannot be used as a target format");
-            }
             RegionFormat::Linear | RegionFormat::BlinearV2 | RegionFormat::BlinearV3 => {
                 if !(1..=22).contains(&level) {
                     bail!("linear and blinear compression levels must be in the range 1..=22");
@@ -152,13 +149,13 @@ impl Cli {
 }
 
 impl SourceFormatArg {
-    pub fn into_region_format(self) -> Option<RegionFormat> {
+    pub fn into_source_format_hint(self) -> Option<SourceFormatHint> {
         match self {
             Self::Auto => None,
-            Self::Mca => Some(RegionFormat::Mca),
-            Self::Linear => Some(RegionFormat::Linear),
-            Self::BlinearV2 => Some(RegionFormat::BlinearV2),
-            Self::BlinearV3 => Some(RegionFormat::BlinearV3),
+            Self::Mca => Some(SourceFormatHint::Mca),
+            Self::Linear => Some(SourceFormatHint::Linear),
+            Self::BlinearV2 => Some(SourceFormatHint::BlinearV2),
+            Self::BlinearV3 => Some(SourceFormatHint::BlinearV3),
         }
     }
 }

@@ -12,6 +12,8 @@ use anyhow::{Context, Result, bail, ensure};
 use xxhash_rust::xxh32::xxh32;
 use xxhash_rust::xxh64::xxh64;
 
+use crate::diagnostic::Diagnostic;
+use crate::io_util::read_file_bytes;
 use crate::model::{ChunkData, Region};
 
 pub const BLINEAR_SUPERBLOCK: i64 = -0x2008_1225_0269;
@@ -22,7 +24,15 @@ pub const BLINEAR_HASH_SEED: u32 = 0x0721;
 pub enum RegionFormat {
     Mca,
     Linear,
-    Blinear,
+    BlinearV2,
+    BlinearV3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum SourceFormatHint {
+    Mca,
+    Linear,
+    BlinearFamily,
     BlinearV2,
     BlinearV3,
 }
@@ -40,15 +50,22 @@ pub enum RegionStorageFormat {
 #[derive(Debug)]
 pub struct ReadOutcome {
     pub region: Region,
-    pub warnings: Vec<String>,
+    pub diagnostics: Vec<Diagnostic>,
     pub discarded_chunks: usize,
+}
+
+#[derive(Debug)]
+pub struct DecodedRegion {
+    pub format: RegionFormat,
+    pub storage_format: RegionStorageFormat,
+    pub outcome: ReadOutcome,
 }
 
 #[derive(Debug)]
 pub struct EncodedRegion {
     pub main_file_bytes: Vec<u8>,
     pub sidecar_files: Vec<SidecarFile>,
-    pub warnings: Vec<String>,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 #[derive(Debug)]
@@ -62,7 +79,7 @@ impl RegionFormat {
         match self {
             Self::Mca => "mca",
             Self::Linear => "linear",
-            Self::Blinear | Self::BlinearV2 | Self::BlinearV3 => "b_linear",
+            Self::BlinearV2 | Self::BlinearV3 => "b_linear",
         }
     }
 
@@ -72,14 +89,13 @@ impl RegionFormat {
 
     pub fn default_compression_level(self) -> i32 {
         match self {
-            Self::Mca => 6,
-            Self::Linear | Self::Blinear | Self::BlinearV2 | Self::BlinearV3 => 6,
+            Self::Mca | Self::Linear | Self::BlinearV2 | Self::BlinearV3 => 6,
         }
     }
 }
 
 impl RegionStorageFormat {
-    pub fn family(self) -> RegionFormat {
+    pub fn as_region_format(self) -> RegionFormat {
         match self {
             Self::Mca => RegionFormat::Mca,
             Self::LinearV1 | Self::LinearV2 | Self::LinearV3 => RegionFormat::Linear,
@@ -94,7 +110,18 @@ impl Display for RegionFormat {
         match self {
             Self::Mca => f.write_str("mca"),
             Self::Linear => f.write_str("linear"),
-            Self::Blinear => f.write_str("blinear"),
+            Self::BlinearV2 => f.write_str("blinear_v2"),
+            Self::BlinearV3 => f.write_str("blinear_v3"),
+        }
+    }
+}
+
+impl Display for SourceFormatHint {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mca => f.write_str("mca"),
+            Self::Linear => f.write_str("linear"),
+            Self::BlinearFamily => f.write_str("blinear"),
             Self::BlinearV2 => f.write_str("blinear_v2"),
             Self::BlinearV3 => f.write_str("blinear_v3"),
         }
@@ -114,17 +141,17 @@ impl Display for RegionStorageFormat {
     }
 }
 
-pub fn guess_format_from_path(path: &Path) -> Result<RegionFormat> {
+pub fn guess_format_from_path(path: &Path) -> Result<SourceFormatHint> {
     match path.extension().and_then(|ext| ext.to_str()) {
-        Some("mca") => Ok(RegionFormat::Mca),
-        Some("linear") => Ok(RegionFormat::Linear),
-        Some("b_linear") => Ok(RegionFormat::Blinear),
+        Some("mca") => Ok(SourceFormatHint::Mca),
+        Some("linear") => Ok(SourceFormatHint::Linear),
+        Some("b_linear") => Ok(SourceFormatHint::BlinearFamily),
         _ => bail!("unsupported region file extension for {}", path.display()),
     }
 }
 
 pub fn detect_format(path: &Path) -> Result<RegionFormat> {
-    Ok(detect_storage_format(path)?.family())
+    Ok(detect_storage_format(path)?.as_region_format())
 }
 
 pub fn detect_storage_format(path: &Path) -> Result<RegionStorageFormat> {
@@ -154,13 +181,52 @@ pub fn region_storage_size(path: &Path, format: RegionStorageFormat) -> Result<u
     }
 }
 
+pub fn decode_region(path: &Path, hint: SourceFormatHint) -> Result<DecodedRegion> {
+    match hint {
+        SourceFormatHint::Mca => Ok(DecodedRegion {
+            format: RegionFormat::Mca,
+            storage_format: RegionStorageFormat::Mca,
+            outcome: mca::read_region(path)?,
+        }),
+        SourceFormatHint::Linear => {
+            let storage_format = detect_storage_format(path)?;
+            Ok(DecodedRegion {
+                format: RegionFormat::Linear,
+                storage_format,
+                outcome: linear::read_region_storage(path, storage_format)?,
+            })
+        }
+        SourceFormatHint::BlinearFamily => read_blinear_region(path),
+        SourceFormatHint::BlinearV2 => Ok(DecodedRegion {
+            format: RegionFormat::BlinearV2,
+            storage_format: RegionStorageFormat::BlinearV2,
+            outcome: blinear_v2::read_region(path)?,
+        }),
+        SourceFormatHint::BlinearV3 => Ok(DecodedRegion {
+            format: RegionFormat::BlinearV3,
+            storage_format: RegionStorageFormat::BlinearV3,
+            outcome: blinear_v3::read_region(path)?,
+        }),
+    }
+}
+
 pub fn read_region(path: &Path, format: RegionFormat) -> Result<ReadOutcome> {
     match format {
         RegionFormat::Mca => mca::read_region(path),
         RegionFormat::Linear => linear::read_region(path),
-        RegionFormat::Blinear => read_region(path, detect_format(path)?),
         RegionFormat::BlinearV2 => blinear_v2::read_region(path),
         RegionFormat::BlinearV3 => blinear_v3::read_region(path),
+    }
+}
+
+pub fn read_region_storage(path: &Path, format: RegionStorageFormat) -> Result<ReadOutcome> {
+    match format {
+        RegionStorageFormat::Mca => mca::read_region(path),
+        RegionStorageFormat::LinearV1
+        | RegionStorageFormat::LinearV2
+        | RegionStorageFormat::LinearV3 => linear::read_region_storage(path, format),
+        RegionStorageFormat::BlinearV2 => blinear_v2::read_region(path),
+        RegionStorageFormat::BlinearV3 => blinear_v3::read_region(path),
     }
 }
 
@@ -172,9 +238,6 @@ pub fn encode_region(
     match format {
         RegionFormat::Mca => mca::encode_region(region, compression_level),
         RegionFormat::Linear => linear::encode_region(region, compression_level),
-        RegionFormat::Blinear => {
-            bail!("generic blinear format is only valid as an input placeholder")
-        }
         RegionFormat::BlinearV2 => blinear_v2::encode_region(region, compression_level),
         RegionFormat::BlinearV3 => blinear_v3::encode_region(region, compression_level),
     }
@@ -288,21 +351,50 @@ pub(crate) fn xxhash64(seed: u64, bytes: &[u8]) -> u64 {
     xxh64(bytes, seed)
 }
 
+fn read_blinear_region(path: &Path) -> Result<DecodedRegion> {
+    let bytes = read_file_bytes(path)?;
+    let storage_format = detect_blinear_format_from_bytes(path, &bytes)?;
+
+    let outcome = match storage_format {
+        RegionStorageFormat::BlinearV2 => blinear_v2::read_region_bytes(path, &bytes)?,
+        RegionStorageFormat::BlinearV3 => blinear_v3::read_region_bytes(path, &bytes)?,
+        _ => bail!("non-blinear storage format routed to blinear reader"),
+    };
+
+    Ok(DecodedRegion {
+        format: storage_format.as_region_format(),
+        storage_format,
+        outcome,
+    })
+}
+
 fn detect_blinear_format(path: &Path) -> Result<RegionStorageFormat> {
     let mut header = [0_u8; 9];
     let mut file =
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     file.read_exact(&mut header)
         .with_context(|| format!("failed to read blinear header from {}", path.display()))?;
+    detect_blinear_format_from_bytes(path, &header)
+}
 
-    let superblock = i64::from_be_bytes(header[0..8].try_into().unwrap());
+pub(crate) fn detect_blinear_format_from_bytes(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<RegionStorageFormat> {
+    ensure!(
+        bytes.len() >= 9,
+        "blinear region {} is too small",
+        path.display()
+    );
+
+    let superblock = i64::from_be_bytes(bytes[0..8].try_into().unwrap());
     ensure!(
         superblock == BLINEAR_SUPERBLOCK,
         "unknown blinear superblock in {}",
         path.display()
     );
 
-    match header[8] {
+    match bytes[8] {
         0x02 => Ok(RegionStorageFormat::BlinearV2),
         0x03 => Ok(RegionStorageFormat::BlinearV3),
         version => bail!(

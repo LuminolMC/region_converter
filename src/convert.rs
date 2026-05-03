@@ -1,37 +1,17 @@
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::sync_channel;
-use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
-use rayon::ThreadPoolBuilder;
-use rayon::prelude::*;
+use anyhow::{Result, anyhow};
 
 use crate::cli::Cli;
-use crate::discovery::{InputDiscovery, Job, discover_jobs_with_summary};
-use crate::formats::{RegionFormat, encode_region, read_region, region_uses_external_chunks};
-use crate::io_util::atomic_write;
+use crate::diagnostic::{Diagnostic, DiagnosticCode, warning_count};
+use crate::discovery::Job;
+use crate::formats::{RegionFormat, SourceFormatHint, decode_region, encode_region};
+use crate::pipeline::stream_parallel;
+use crate::planner::plan_conversion;
+use crate::writer::write_encoded_region;
 
-#[derive(Debug)]
-pub struct RunPlan {
-    pub input_paths: Vec<PathBuf>,
-    pub output_root: PathBuf,
-    pub source_format: Option<RegionFormat>,
-    pub requested_thread_count: usize,
-    pub target_format: RegionFormat,
-    pub thread_count: usize,
-    pub compression_level: i32,
-    pub total_jobs: usize,
-    pub total_region_directories: usize,
-    pub source_breakdown: Vec<FormatBreakdown>,
-    pub input_summaries: Vec<InputDiscovery>,
-}
-
-#[derive(Debug)]
-pub struct FormatBreakdown {
-    pub format: RegionFormat,
-    pub job_count: usize,
-}
+pub use crate::planner::{FormatBreakdown, RunPlan};
 
 #[derive(Debug)]
 pub struct RunSummary {
@@ -68,24 +48,24 @@ pub enum JobReport {
 
 #[derive(Debug)]
 pub struct JobSuccess {
-    pub source_file: String,
-    pub destination_file: String,
-    pub source_format: RegionFormat,
+    pub source_file: PathBuf,
+    pub destination_file: PathBuf,
+    pub source_format: Option<RegionFormat>,
     pub target_format: RegionFormat,
     pub chunk_count: usize,
     pub discarded_chunks: usize,
-    pub warnings: Vec<String>,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 #[derive(Debug)]
 pub struct JobFailure {
-    pub source_file: String,
-    pub destination_file: String,
-    pub source_format: RegionFormat,
+    pub source_file: PathBuf,
+    pub destination_file: PathBuf,
+    pub source_format: Option<RegionFormat>,
     pub target_format: RegionFormat,
     pub discarded_chunks: usize,
-    pub warnings: Vec<String>,
-    pub error: String,
+    pub diagnostics: Vec<Diagnostic>,
+    pub error: Diagnostic,
 }
 
 pub trait RunObserver {
@@ -108,38 +88,15 @@ pub fn run(cli: Cli) -> Result<RunSummary> {
 }
 
 pub fn run_with_observer(cli: Cli, observer: &mut dyn RunObserver) -> Result<RunSummary> {
-    cli.validate()?;
-    let requested_thread_count = cli.thread_count()?;
-    let source_format = cli.forced_source_format();
-    let target_format = cli.target_format()?;
-    let compression_level = cli.resolved_compression_level()?;
-    let discovery = discover_jobs_with_summary(
-        &cli.inputs,
-        cli.output_root()?,
-        source_format,
-        target_format,
-    )?;
-    let thread_count = requested_thread_count.min(discovery.jobs.len().max(1));
-
-    let plan = build_run_plan(
-        &cli,
-        source_format,
-        target_format,
-        requested_thread_count,
-        thread_count,
-        compression_level,
-        &discovery.jobs,
-        discovery.summary.inputs,
-        discovery.summary.total_region_directories,
-    );
-    observer.on_plan(&plan)?;
+    let plan = plan_conversion(&cli)?;
+    observer.on_plan(&plan.run_plan)?;
 
     let summary = execute_jobs(
-        discovery.jobs,
-        target_format,
-        compression_level,
-        thread_count,
-        plan.total_region_directories,
+        plan.jobs,
+        plan.target_format,
+        plan.compression_level,
+        plan.run_plan.thread_count,
+        plan.run_plan.total_region_directories,
         observer,
     )?;
     observer.on_finish(&summary)?;
@@ -181,23 +138,6 @@ fn execute_jobs(
     observer: &mut dyn RunObserver,
 ) -> Result<RunSummary> {
     let total_jobs = jobs.len();
-    let pool = ThreadPoolBuilder::new()
-        .num_threads(thread_count)
-        .build()
-        .context("failed to build the Rayon thread pool")?;
-    let queue_depth = thread_count.saturating_mul(2).max(1);
-    let (sender, receiver) = sync_channel::<JobReport>(queue_depth);
-
-    let worker = thread::spawn(move || {
-        pool.install(|| {
-            jobs.into_par_iter()
-                .for_each_with(sender, |job_sender, job| {
-                    let report = process_job(job, target_format, compression_level);
-                    let _ = job_sender.send(report);
-                });
-        });
-    });
-
     let started_at = Instant::now();
     let mut accumulator = SummaryAccumulator::new(
         total_jobs,
@@ -206,163 +146,115 @@ fn execute_jobs(
         target_format,
         compression_level,
     );
-    let mut observer_error = None;
 
-    for report in receiver {
-        accumulator.apply(&report, started_at.elapsed());
-        if observer_error.is_none() {
-            if let Err(error) = observer.on_job_report(&report, &accumulator.snapshot) {
-                observer_error = Some(error);
-            }
-        }
-    }
-
-    worker
-        .join()
-        .map_err(|_| anyhow::anyhow!("conversion worker thread panicked"))?;
-
-    if let Some(error) = observer_error {
-        return Err(error);
-    }
+    stream_parallel(
+        jobs,
+        thread_count,
+        move |job| process_job(job, target_format, compression_level),
+        |report| {
+            accumulator.apply(&report, started_at.elapsed());
+            observer.on_job_report(&report, &accumulator.snapshot)?;
+            Ok(())
+        },
+    )?;
 
     Ok(accumulator.finish(started_at.elapsed()))
 }
 
-fn build_run_plan(
-    cli: &Cli,
-    source_format: Option<RegionFormat>,
-    target_format: RegionFormat,
-    requested_thread_count: usize,
-    thread_count: usize,
-    compression_level: i32,
-    jobs: &[Job],
-    input_summaries: Vec<InputDiscovery>,
-    total_region_directories: usize,
-) -> RunPlan {
-    RunPlan {
-        input_paths: cli.inputs.clone(),
-        output_root: cli
-            .output
-            .clone()
-            .expect("conversion mode should always have an output root"),
-        source_format,
-        requested_thread_count,
-        target_format,
-        thread_count,
-        compression_level,
-        total_jobs: jobs.len(),
-        total_region_directories,
-        source_breakdown: build_source_breakdown(jobs),
-        input_summaries,
-    }
-}
-
-fn build_source_breakdown(jobs: &[Job]) -> Vec<FormatBreakdown> {
-    let formats = [
-        RegionFormat::Mca,
-        RegionFormat::Linear,
-        RegionFormat::Blinear,
-        RegionFormat::BlinearV2,
-        RegionFormat::BlinearV3,
-    ];
-    let mut breakdown = Vec::new();
-
-    for format in formats {
-        let job_count = jobs
-            .iter()
-            .filter(|job| job.source_format == format)
-            .count();
-        if job_count > 0 {
-            breakdown.push(FormatBreakdown { format, job_count });
-        }
-    }
-
-    breakdown
-}
-
 fn process_job(job: Job, target_format: RegionFormat, compression_level: i32) -> JobReport {
-    let source_file = job.source_file.display().to_string();
-    let destination_file = job.destination_file.display().to_string();
-    let mut resolved_source_format = job.source_format;
-    let mut warnings = Vec::new();
+    let mut resolved_source_format = hinted_region_format(job.source_format);
+    let mut diagnostics = Vec::new();
     let mut discarded_chunks = 0;
+    let mut stage = JobStage::Decode;
 
-    let result = (|| -> Result<ProcessedJob> {
-        resolved_source_format = match job.source_format {
-            RegionFormat::Blinear => crate::formats::detect_format(&job.source_file)?,
-            format => format,
-        };
+    let result = (|| -> Result<usize> {
+        let mut decoded = decode_region(&job.source_file, job.source_format).map_err(|error| {
+            anyhow!("failed to decode {}: {error:#}", job.source_file.display())
+        })?;
+        resolved_source_format = Some(decoded.format);
+        diagnostics.append(&mut decoded.outcome.diagnostics);
+        discarded_chunks = decoded.outcome.discarded_chunks;
+        let chunk_count = decoded.outcome.region.chunk_count();
 
-        let mut read = read_region(&job.source_file, resolved_source_format)
-            .with_context(|| format!("failed to decode {}", job.source_file.display()))?;
-        let chunk_count = read.region.chunk_count();
-        discarded_chunks = read.discarded_chunks;
-        warnings.append(&mut read.warnings);
-
-        let mut encoded = encode_region(&read.region, target_format, compression_level)
-            .with_context(|| {
-                format!(
-                    "failed to encode {} as {}",
+        stage = JobStage::Encode;
+        let mut encoded = encode_region(&decoded.outcome.region, target_format, compression_level)
+            .map_err(|error| {
+                anyhow!(
+                    "failed to encode {} as {}: {error:#}",
                     job.source_file.display(),
                     target_format
                 )
             })?;
-        warnings.append(&mut encoded.warnings);
+        diagnostics.append(&mut encoded.diagnostics);
 
-        write_encoded_region(target_format, &job.destination_file, &encoded)
-            .with_context(|| format!("failed to write {}", job.destination_file.display()))?;
+        stage = JobStage::Write;
+        write_encoded_region(target_format, &job.destination_file, &encoded).map_err(|error| {
+            anyhow!(
+                "failed to write {}: {error:#}",
+                job.destination_file.display()
+            )
+        })?;
 
-        Ok(ProcessedJob { chunk_count })
+        Ok(chunk_count)
     })();
 
     match result {
-        Ok(success) => JobReport::Success(JobSuccess {
-            source_file,
-            destination_file,
+        Ok(chunk_count) => JobReport::Success(JobSuccess {
+            source_file: job.source_file,
+            destination_file: job.destination_file,
             source_format: resolved_source_format,
             target_format,
-            chunk_count: success.chunk_count,
+            chunk_count,
             discarded_chunks,
-            warnings,
+            diagnostics,
         }),
         Err(error) => JobReport::Failure(JobFailure {
-            source_file,
-            destination_file,
+            source_file: job.source_file.clone(),
+            destination_file: job.destination_file.clone(),
             source_format: resolved_source_format,
             target_format,
             discarded_chunks,
-            warnings,
-            error: format!("{error:#}"),
+            diagnostics,
+            error: build_failure_diagnostic(stage, &job.source_file, &job.destination_file, error),
         }),
     }
 }
 
-fn write_encoded_region(
-    target_format: RegionFormat,
+fn hinted_region_format(hint: SourceFormatHint) -> Option<RegionFormat> {
+    match hint {
+        SourceFormatHint::Mca => Some(RegionFormat::Mca),
+        SourceFormatHint::Linear => Some(RegionFormat::Linear),
+        SourceFormatHint::BlinearFamily => None,
+        SourceFormatHint::BlinearV2 => Some(RegionFormat::BlinearV2),
+        SourceFormatHint::BlinearV3 => Some(RegionFormat::BlinearV3),
+    }
+}
+
+fn build_failure_diagnostic(
+    stage: JobStage,
+    source_file: &Path,
     destination_file: &Path,
-    encoded: &crate::formats::EncodedRegion,
-) -> Result<()> {
-    let destination_dir = destination_file
-        .parent()
-        .context("destination file does not have a parent directory")?;
-
-    if target_format == RegionFormat::Mca
-        && !encoded.sidecar_files.is_empty()
-        && destination_file.exists()
-        && region_uses_external_chunks(destination_file)?
-    {
-        bail!(
-            "refusing to overwrite {} because it already uses external .mcc chunks and replacing the sidecars plus header atomically is not currently safe",
-            destination_file.display()
-        );
+    error: anyhow::Error,
+) -> Diagnostic {
+    match stage {
+        JobStage::Decode => Diagnostic::error(DiagnosticCode::CorruptRegion, format!("{error:#}"))
+            .with_path(source_file),
+        JobStage::Encode => {
+            Diagnostic::error(DiagnosticCode::InvalidMetadata, format!("{error:#}"))
+                .with_path(source_file)
+        }
+        JobStage::Write => {
+            let code = if error
+                .to_string()
+                .contains("replacing the sidecars plus header atomically is not currently safe")
+            {
+                DiagnosticCode::OutputSafety
+            } else {
+                DiagnosticCode::Io
+            };
+            Diagnostic::error(code, format!("{error:#}")).with_path(destination_file)
+        }
     }
-
-    for sidecar in &encoded.sidecar_files {
-        atomic_write(&destination_dir.join(&sidecar.file_name), &sidecar.bytes)?;
-    }
-    atomic_write(destination_file, &encoded.main_file_bytes)?;
-
-    Ok(())
 }
 
 fn ratio_per_second(value: usize, elapsed: Duration) -> f64 {
@@ -426,12 +318,12 @@ impl SummaryAccumulator {
                 self.successful_jobs += 1;
                 self.total_chunks_written += report.chunk_count;
                 self.total_discarded_chunks += report.discarded_chunks;
-                self.total_warnings += report.warnings.len();
+                self.total_warnings += warning_count(&report.diagnostics);
             }
             JobReport::Failure(report) => {
                 self.failed_jobs += 1;
                 self.total_discarded_chunks += report.discarded_chunks;
-                self.total_warnings += report.warnings.len();
+                self.total_warnings += warning_count(&report.diagnostics);
             }
         }
 
@@ -464,8 +356,11 @@ impl SummaryAccumulator {
     }
 }
 
-struct ProcessedJob {
-    chunk_count: usize,
+#[derive(Clone, Copy)]
+enum JobStage {
+    Decode,
+    Encode,
+    Write,
 }
 
 struct NoopRunObserver;

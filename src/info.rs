@@ -3,14 +3,15 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use rayon::ThreadPoolBuilder;
-use rayon::prelude::*;
 
 use crate::cli::Cli;
-use crate::discovery::{InputKind, discover_sources_with_summary};
+use crate::diagnostic::{Diagnostic, DiagnosticCode, warning_count};
+use crate::discovery::{InputKind, RegionSource};
 use crate::formats::{
-    RegionStorageFormat, detect_storage_format, read_region, region_storage_size,
+    RegionStorageFormat, detect_storage_format, read_region_storage, region_storage_size,
 };
+use crate::pipeline::collect_parallel;
+use crate::planner::plan_inspection;
 
 #[derive(Clone, Debug)]
 pub struct FormatCount {
@@ -28,8 +29,8 @@ pub struct RegionInfoEntry {
     pub region_z: Option<i32>,
     pub chunk_count: usize,
     pub discarded_chunks: usize,
-    pub warnings: Vec<String>,
-    pub error: Option<String>,
+    pub diagnostics: Vec<Diagnostic>,
+    pub error: Option<Diagnostic>,
 }
 
 #[derive(Clone, Debug)]
@@ -62,27 +63,14 @@ pub struct InfoSummary {
 }
 
 pub fn inspect(cli: Cli) -> Result<InfoSummary> {
-    cli.validate()?;
-    let requested_thread_count = cli.thread_count()?;
-    let discovery = discover_sources_with_summary(&cli.inputs, None, None)?;
-    let thread_count = requested_thread_count.min(discovery.sources.len().max(1));
+    let plan = plan_inspection(&cli)?;
 
     let started_at = Instant::now();
-    let pool = ThreadPoolBuilder::new()
-        .num_threads(thread_count)
-        .build()
-        .context("failed to build the Rayon thread pool")?;
-    let entries = pool.install(|| {
-        discovery
-            .sources
-            .par_iter()
-            .map(inspect_source)
-            .collect::<Vec<_>>()
-    });
+    let entries = collect_parallel(&plan.sources, plan.thread_count, inspect_source)?;
     let elapsed = started_at.elapsed();
 
-    let mut builders = discovery
-        .summary
+    let mut builders = plan
+        .discovery_summary
         .inputs
         .iter()
         .map(|input| InputInfoBuilder::new(input.input_path.clone(), input.input_kind))
@@ -101,7 +89,7 @@ pub fn inspect(cli: Cli) -> Result<InfoSummary> {
         total_size_bytes += entry.size_bytes.unwrap_or(0);
         chunk_count += entry.chunk_count;
         discarded_chunks += entry.discarded_chunks;
-        warnings += entry.warnings.len();
+        warnings += warning_count(&entry.diagnostics);
 
         let builder = builders
             .get_mut(entry.input_index)
@@ -116,7 +104,7 @@ pub fn inspect(cli: Cli) -> Result<InfoSummary> {
     }
 
     Ok(InfoSummary {
-        thread_count,
+        thread_count: plan.thread_count,
         inputs: builders.into_iter().map(InputInfoBuilder::finish).collect(),
         entries,
         total_region_files,
@@ -130,7 +118,7 @@ pub fn inspect(cli: Cli) -> Result<InfoSummary> {
     })
 }
 
-fn inspect_source(source: &crate::discovery::RegionSource) -> RegionInfoEntry {
+fn inspect_source(source: &RegionSource) -> RegionInfoEntry {
     let file_size_bytes = source
         .source_file
         .metadata()
@@ -149,8 +137,11 @@ fn inspect_source(source: &crate::discovery::RegionSource) -> RegionInfoEntry {
                 region_z: None,
                 chunk_count: 0,
                 discarded_chunks: 0,
-                warnings: Vec::new(),
-                error: Some(format!("{error:#}")),
+                diagnostics: Vec::new(),
+                error: Some(
+                    Diagnostic::error(DiagnosticCode::UnsupportedFormat, format!("{error:#}"))
+                        .with_path(&source.source_file),
+                ),
             };
         }
     };
@@ -167,13 +158,16 @@ fn inspect_source(source: &crate::discovery::RegionSource) -> RegionInfoEntry {
                 region_z: None,
                 chunk_count: 0,
                 discarded_chunks: 0,
-                warnings: Vec::new(),
-                error: Some(format!("{error:#}")),
+                diagnostics: Vec::new(),
+                error: Some(
+                    Diagnostic::error(DiagnosticCode::Io, format!("{error:#}"))
+                        .with_path(&source.source_file),
+                ),
             };
         }
     };
 
-    match read_region(&source.source_file, storage_format.family()) {
+    match read_region_storage(&source.source_file, storage_format) {
         Ok(read) => RegionInfoEntry {
             input_index: source.input_index,
             source_file: source.source_file.clone(),
@@ -183,7 +177,7 @@ fn inspect_source(source: &crate::discovery::RegionSource) -> RegionInfoEntry {
             region_z: Some(read.region.region_z),
             chunk_count: read.region.chunk_count(),
             discarded_chunks: read.discarded_chunks,
-            warnings: read.warnings,
+            diagnostics: read.diagnostics,
             error: None,
         },
         Err(error) => RegionInfoEntry {
@@ -195,8 +189,11 @@ fn inspect_source(source: &crate::discovery::RegionSource) -> RegionInfoEntry {
             region_z: None,
             chunk_count: 0,
             discarded_chunks: 0,
-            warnings: Vec::new(),
-            error: Some(format!("{error:#}")),
+            diagnostics: Vec::new(),
+            error: Some(
+                Diagnostic::error(DiagnosticCode::CorruptRegion, format!("{error:#}"))
+                    .with_path(&source.source_file),
+            ),
         },
     }
 }
@@ -235,7 +232,7 @@ impl InputInfoBuilder {
         self.total_size_bytes += entry.size_bytes.unwrap_or(0);
         self.chunk_count += entry.chunk_count;
         self.discarded_chunks += entry.discarded_chunks;
-        self.warnings += entry.warnings.len();
+        self.warnings += warning_count(&entry.diagnostics);
 
         if let Some(format) = entry.storage_format {
             self.formats

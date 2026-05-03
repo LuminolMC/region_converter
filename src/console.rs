@@ -9,7 +9,7 @@ use region_converter::convert::{
     JobFailure, JobReport, ProgressSnapshot, RunObserver, RunPlan, RunSummary,
 };
 use region_converter::discovery::InputKind;
-use region_converter::formats::RegionFormat;
+use region_converter::formats::SourceFormatHint;
 use region_converter::info::{FormatCount, InfoSummary, RegionInfoEntry};
 
 const BAR_WIDTH: usize = 28;
@@ -117,10 +117,12 @@ impl RunObserver for ConsoleReporter {
         if let Some(bar) = self.progress.as_mut() {
             match report {
                 JobReport::Success(report) => {
-                    for warning in &report.warnings {
+                    for warning in &report.diagnostics {
                         bar.println(&format!(
                             "warning [{} -> {}]: {}",
-                            report.source_file, report.destination_file, warning
+                            report.source_file.display(),
+                            report.destination_file.display(),
+                            warning
                         ));
                     }
                 }
@@ -156,20 +158,24 @@ impl RunObserver for ConsoleReporter {
 }
 
 fn print_failure(bar: &IndicatifProgress, report: &JobFailure) {
-    for warning in &report.warnings {
+    for warning in &report.diagnostics {
         bar.println(&format!(
             "warning [{} -> {}]: {}",
-            report.source_file, report.destination_file, warning
+            report.source_file.display(),
+            report.destination_file.display(),
+            warning
         ));
     }
 
     bar.println(&format!(
         "error [{} -> {}]: {}",
-        report.source_file, report.destination_file, report.error
+        report.source_file.display(),
+        report.destination_file.display(),
+        report.error
     ));
 }
 
-fn format_source_mode(source_format: Option<RegionFormat>) -> String {
+fn format_source_mode(source_format: Option<SourceFormatHint>) -> String {
     match source_format {
         Some(format) => format.to_string(),
         None => "auto".to_string(),
@@ -264,12 +270,12 @@ fn print_info_issues(summary: &InfoSummary) {
     let warning_entries = summary
         .entries
         .iter()
-        .filter(|entry| !entry.warnings.is_empty())
+        .filter(|entry| !entry.diagnostics.is_empty())
         .collect::<Vec<_>>();
     if !warning_entries.is_empty() {
         println!("Warnings:");
         for entry in warning_entries {
-            for warning in &entry.warnings {
+            for warning in &entry.diagnostics {
                 println!("  - [{}] {}", entry.source_file.display(), warning);
             }
         }

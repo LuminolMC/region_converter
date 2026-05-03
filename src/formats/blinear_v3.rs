@@ -3,10 +3,12 @@ use std::path::Path;
 use anyhow::{Context, Result, ensure};
 use byteorder::{BigEndian, WriteBytesExt};
 
+use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::formats::{
     BLINEAR_HASH_SEED, BLINEAR_SUPERBLOCK, EncodedRegion, ReadOutcome, decode_chunk_section,
     encode_chunk_section, parse_region_coords_from_path,
 };
+use crate::io_util::read_file_bytes;
 use crate::model::{REGION_CHUNK_COUNT, Region};
 
 const HEADER_SIZE: usize = 14;
@@ -17,8 +19,11 @@ const POSITION_TABLE_SIZE: usize = BUCKET_COUNT * 8;
 const DATA_START_OFFSET: usize = HEADER_SIZE + POSITION_TABLE_SIZE;
 
 pub fn read_region(path: &Path) -> Result<ReadOutcome> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let bytes = read_file_bytes(path)?;
+    read_region_bytes(path, &bytes)
+}
+
+pub(crate) fn read_region_bytes(path: &Path, bytes: &[u8]) -> Result<ReadOutcome> {
     ensure!(
         bytes.len() >= DATA_START_OFFSET,
         "blinear_v3 region {} is too small",
@@ -46,7 +51,7 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
     }
 
     let mut region = Region::new(region_x, region_z);
-    let mut warnings = Vec::new();
+    let mut diagnostics = Vec::new();
     let mut discarded_chunks = 0;
 
     for (bucket_index, bucket_offset) in offsets.into_iter().enumerate() {
@@ -56,10 +61,14 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
 
         let bucket_offset = bucket_offset as usize;
         if bucket_offset < DATA_START_OFFSET || bucket_offset + 8 > bytes.len() {
-            warnings.push(format!(
-                "bucket {bucket_index} in {} points outside the file and was skipped",
-                path.display()
-            ));
+            diagnostics.push(
+                Diagnostic::warning(
+                    DiagnosticCode::SkippedData,
+                    format!("bucket {bucket_index} points outside the file and was skipped"),
+                )
+                .with_path(path)
+                .with_region_coords(region_x, region_z),
+            );
             continue;
         }
 
@@ -72,10 +81,14 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
         );
 
         if original_len <= 0 || compressed_len <= 0 {
-            warnings.push(format!(
-                "bucket {bucket_index} in {} has an invalid length header and was skipped",
-                path.display()
-            ));
+            diagnostics.push(
+                Diagnostic::warning(
+                    DiagnosticCode::InvalidMetadata,
+                    format!("bucket {bucket_index} has an invalid length header and was skipped"),
+                )
+                .with_path(path)
+                .with_region_coords(region_x, region_z),
+            );
             continue;
         }
 
@@ -85,10 +98,14 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
         let compressed_end = compressed_start + compressed_len;
 
         if compressed_end > bytes.len() {
-            warnings.push(format!(
-                "bucket {bucket_index} in {} overruns the file and was skipped",
-                path.display()
-            ));
+            diagnostics.push(
+                Diagnostic::warning(
+                    DiagnosticCode::SkippedData,
+                    format!("bucket {bucket_index} overruns the file and was skipped"),
+                )
+                .with_path(path)
+                .with_region_coords(region_x, region_z),
+            );
             continue;
         }
 
@@ -98,10 +115,16 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
         ) {
             Ok(data) => data,
             Err(error) => {
-                warnings.push(format!(
-                    "bucket {bucket_index} in {} failed zstd decompression and was skipped: {error}",
-                    path.display()
-                ));
+                diagnostics.push(
+                    Diagnostic::warning(
+                        DiagnosticCode::CorruptBucket,
+                        format!(
+                            "bucket {bucket_index} failed zstd decompression and was skipped: {error}"
+                        ),
+                    )
+                    .with_path(path)
+                    .with_region_coords(region_x, region_z),
+                );
                 continue;
             }
         };
@@ -112,10 +135,15 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
 
         for index in first_chunk..first_chunk + BUCKET_SIZE {
             if local_offset + 4 > decompressed.len() {
-                warnings.push(format!(
-                    "bucket {bucket_index} in {} ended early while reading slot {index}",
-                    path.display()
-                ));
+                diagnostics.push(
+                    Diagnostic::warning(
+                        DiagnosticCode::CorruptBucket,
+                        format!("bucket {bucket_index} ended early while reading slot {index}"),
+                    )
+                    .with_path(path)
+                    .with_region_coords(region_x, region_z)
+                    .with_chunk_index(index),
+                );
                 bucket_valid = false;
                 break;
             }
@@ -128,10 +156,17 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
             local_offset += 4;
 
             if section_len < 0 {
-                warnings.push(format!(
-                    "bucket {bucket_index} in {} contains a negative section length at slot {index}",
-                    path.display()
-                ));
+                diagnostics.push(
+                    Diagnostic::warning(
+                        DiagnosticCode::InvalidMetadata,
+                        format!(
+                            "bucket {bucket_index} contains a negative section length at slot {index}"
+                        ),
+                    )
+                    .with_path(path)
+                    .with_region_coords(region_x, region_z)
+                    .with_chunk_index(index),
+                );
                 bucket_valid = false;
                 break;
             }
@@ -142,10 +177,17 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
 
             let section_len = section_len as usize;
             if local_offset + section_len > decompressed.len() {
-                warnings.push(format!(
-                    "bucket {bucket_index} in {} overruns its decompressed buffer at slot {index}",
-                    path.display()
-                ));
+                diagnostics.push(
+                    Diagnostic::warning(
+                        DiagnosticCode::SkippedData,
+                        format!(
+                            "bucket {bucket_index} overruns its decompressed buffer at slot {index}"
+                        ),
+                    )
+                    .with_path(path)
+                    .with_region_coords(region_x, region_z)
+                    .with_chunk_index(index),
+                );
                 bucket_valid = false;
                 break;
             }
@@ -156,26 +198,35 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
             match decode_chunk_section(section, hash_seed) {
                 Ok(chunk) => region.set_chunk(index, chunk)?,
                 Err(error) => {
-                    warnings.push(format!(
-                        "chunk slot {index} in {} is corrupted and was skipped: {error:#}",
-                        path.display()
-                    ));
+                    diagnostics.push(
+                        Diagnostic::warning(
+                            DiagnosticCode::CorruptChunk,
+                            format!("chunk is corrupted and was skipped: {error:#}"),
+                        )
+                        .with_path(path)
+                        .with_region_coords(region_x, region_z)
+                        .with_chunk_index(index),
+                    );
                     discarded_chunks += 1;
                 }
             }
         }
 
         if bucket_valid && local_offset != decompressed.len() {
-            warnings.push(format!(
-                "bucket {bucket_index} in {} has trailing bytes after its 64 chunk slots",
-                path.display()
-            ));
+            diagnostics.push(
+                Diagnostic::warning(
+                    DiagnosticCode::SkippedData,
+                    format!("bucket {bucket_index} has trailing bytes after its 64 chunk slots"),
+                )
+                .with_path(path)
+                .with_region_coords(region_x, region_z),
+            );
         }
     }
 
     Ok(ReadOutcome {
         region,
-        warnings,
+        diagnostics,
         discarded_chunks,
     })
 }
@@ -233,6 +284,6 @@ pub fn encode_region(region: &Region, compression_level: i32) -> Result<EncodedR
     Ok(EncodedRegion {
         main_file_bytes,
         sidecar_files: Vec::new(),
-        warnings: Vec::new(),
+        diagnostics: Vec::new(),
     })
 }

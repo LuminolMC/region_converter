@@ -8,8 +8,8 @@ use anyhow::{Context, Result, bail};
 use walkdir::WalkDir;
 
 use crate::formats::{
-    RegionFormat, guess_format_from_path, looks_like_region_file, parse_region_coords_from_path,
-    xxhash32,
+    RegionFormat, SourceFormatHint, guess_format_from_path, looks_like_region_file,
+    parse_region_coords_from_path, xxhash32,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -22,7 +22,7 @@ pub enum InputKind {
 #[derive(Clone, Debug)]
 pub struct Job {
     pub source_file: PathBuf,
-    pub source_format: RegionFormat,
+    pub source_format: SourceFormatHint,
     pub destination_file: PathBuf,
 }
 
@@ -31,7 +31,7 @@ pub struct RegionSource {
     pub input_index: usize,
     pub input_kind: InputKind,
     pub source_file: PathBuf,
-    pub source_format: RegionFormat,
+    pub source_format: SourceFormatHint,
     pub relative_region_dir: PathBuf,
 }
 
@@ -74,7 +74,7 @@ impl Display for InputKind {
 pub fn discover_jobs(
     inputs: &[PathBuf],
     output_root: &Path,
-    forced_format: Option<RegionFormat>,
+    forced_format: Option<SourceFormatHint>,
     target_format: RegionFormat,
 ) -> Result<Vec<Job>> {
     Ok(discover_jobs_with_summary(inputs, output_root, forced_format, target_format)?.jobs)
@@ -83,7 +83,7 @@ pub fn discover_jobs(
 pub fn discover_jobs_with_summary(
     inputs: &[PathBuf],
     output_root: &Path,
-    forced_format: Option<RegionFormat>,
+    forced_format: Option<SourceFormatHint>,
     target_format: RegionFormat,
 ) -> Result<DiscoveryResult> {
     let discovery = discover_sources_with_summary(inputs, forced_format, Some(output_root))?;
@@ -128,7 +128,7 @@ pub fn discover_jobs_with_summary(
 
 pub fn discover_sources_with_summary(
     inputs: &[PathBuf],
-    forced_format: Option<RegionFormat>,
+    forced_format: Option<SourceFormatHint>,
     excluded_root: Option<&Path>,
 ) -> Result<SourceDiscoveryResult> {
     let mut sources = Vec::new();
@@ -266,7 +266,7 @@ fn append_sources(
     input_kind: InputKind,
     files: &[PathBuf],
     relative_region_dir: &Path,
-    forced_format: Option<RegionFormat>,
+    forced_format: Option<SourceFormatHint>,
 ) -> Result<()> {
     for source_file in files {
         sources.push(RegionSource {
@@ -281,7 +281,10 @@ fn append_sources(
     Ok(())
 }
 
-fn resolve_source_format(path: &Path, forced_format: Option<RegionFormat>) -> Result<RegionFormat> {
+fn resolve_source_format(
+    path: &Path,
+    forced_format: Option<SourceFormatHint>,
+) -> Result<SourceFormatHint> {
     match forced_format {
         Some(format) => Ok(format),
         None => guess_format_from_path(path),

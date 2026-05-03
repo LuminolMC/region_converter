@@ -4,10 +4,12 @@ use std::path::Path;
 use anyhow::{Context, Result, bail, ensure};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
+use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::formats::{
     EncodedRegion, LINEAR_SUPERBLOCK, ReadOutcome, RegionStorageFormat,
     parse_region_coords_from_path, xxhash64,
 };
+use crate::io_util::read_file_bytes;
 use crate::model::{ChunkData, REGION_CHUNK_COUNT, Region};
 
 const CLASSIC_FILE_HEADER_SIZE: usize = 32;
@@ -29,15 +31,27 @@ pub(crate) fn detect_storage_format(path: &Path) -> Result<RegionStorageFormat> 
         std::fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     file.read_exact(&mut header)
         .with_context(|| format!("failed to read linear header from {}", path.display()))?;
+    detect_storage_format_from_bytes(path, &header)
+}
 
-    let superblock = u64::from_be_bytes(header[0..8].try_into().unwrap());
+pub(crate) fn detect_storage_format_from_bytes(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<RegionStorageFormat> {
+    ensure!(
+        bytes.len() >= 9,
+        "linear region {} is too small",
+        path.display()
+    );
+
+    let superblock = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
     ensure!(
         superblock == LINEAR_SUPERBLOCK,
         "invalid linear superblock in {}",
         path.display()
     );
 
-    match header[8] {
+    match bytes[8] {
         1 => Ok(RegionStorageFormat::LinearV1),
         2 => Ok(RegionStorageFormat::LinearV2),
         3 => Ok(RegionStorageFormat::LinearV3),
@@ -46,28 +60,37 @@ pub(crate) fn detect_storage_format(path: &Path) -> Result<RegionStorageFormat> 
 }
 
 pub fn read_region(path: &Path) -> Result<ReadOutcome> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    ensure!(
-        bytes.len() >= 9,
-        "linear region {} is too small",
-        path.display()
-    );
+    let bytes = read_file_bytes(path)?;
+    let storage_format = detect_storage_format_from_bytes(path, &bytes)?;
+    read_region_from_bytes(path, &bytes, storage_format)
+}
 
-    let (region_x, region_z) = parse_region_coords_from_path(path)?;
-    let storage_format = detect_storage_format(path)?;
-
-    match storage_format {
-        RegionStorageFormat::LinearV1 | RegionStorageFormat::LinearV2 => {
-            read_classic_region(&bytes, path, region_x, region_z)
-        }
-        RegionStorageFormat::LinearV3 => read_modern_region(&bytes, path, region_x, region_z),
-        _ => bail!("non-linear storage format routed to linear reader"),
-    }
+pub(crate) fn read_region_storage(
+    path: &Path,
+    storage_format: RegionStorageFormat,
+) -> Result<ReadOutcome> {
+    let bytes = read_file_bytes(path)?;
+    read_region_from_bytes(path, &bytes, storage_format)
 }
 
 pub fn encode_region(region: &Region, compression_level: i32) -> Result<EncodedRegion> {
     encode_modern_region(region, compression_level)
+}
+
+fn read_region_from_bytes(
+    path: &Path,
+    bytes: &[u8],
+    storage_format: RegionStorageFormat,
+) -> Result<ReadOutcome> {
+    let (region_x, region_z) = parse_region_coords_from_path(path)?;
+
+    match storage_format {
+        RegionStorageFormat::LinearV1 | RegionStorageFormat::LinearV2 => {
+            read_classic_region(bytes, path, region_x, region_z)
+        }
+        RegionStorageFormat::LinearV3 => read_modern_region(bytes, path, region_x, region_z),
+        _ => bail!("non-linear storage format routed to linear reader"),
+    }
 }
 
 fn read_classic_region(
@@ -172,7 +195,7 @@ fn read_classic_region(
 
     Ok(ReadOutcome {
         region,
-        warnings: Vec::new(),
+        diagnostics: Vec::new(),
         discarded_chunks: 0,
     })
 }
@@ -209,11 +232,18 @@ fn read_modern_region(
     let mut existence_bitmap = [0_u8; MODERN_EXISTENCE_BITMAP_SIZE];
     cursor.read_exact(&mut existence_bitmap)?;
 
-    let mut warnings = Vec::new();
+    let mut diagnostics = Vec::new();
     if header_region_x != region_x || header_region_z != region_z {
-        warnings.push(format!(
-            "linear_v3 header coordinates ({header_region_x}, {header_region_z}) do not match file name coordinates ({region_x}, {region_z})"
-        ));
+        diagnostics.push(
+            Diagnostic::warning(
+                DiagnosticCode::FormatMismatch,
+                format!(
+                    "linear_v3 header coordinates ({header_region_x}, {header_region_z}) do not match file name coordinates ({region_x}, {region_z})"
+                ),
+            )
+            .with_path(path)
+            .with_region_coords(region_x, region_z),
+        );
     }
 
     loop {
@@ -291,10 +321,17 @@ fn read_modern_region(
                         (bx * bucket_side + local_x) + (bz * bucket_side + local_z) * 32;
 
                     if local.position() as usize + 12 > decompressed.len() {
-                        warnings.push(format!(
-                            "linear_v3 bucket {bucket_index} in {} ended early while reading slot {chunk_index}",
-                            path.display()
-                        ));
+                        diagnostics.push(
+                            Diagnostic::warning(
+                                DiagnosticCode::CorruptBucket,
+                                format!(
+                                    "linear_v3 bucket {bucket_index} ended early while reading slot {chunk_index}"
+                                ),
+                            )
+                            .with_path(path)
+                            .with_region_coords(region_x, region_z)
+                            .with_chunk_index(chunk_index),
+                        );
                         bucket_valid = false;
                         break;
                     }
@@ -303,10 +340,17 @@ fn read_modern_region(
                     let timestamp = local.read_i64::<BigEndian>()?;
 
                     if chunk_size < 0 {
-                        warnings.push(format!(
-                            "linear_v3 bucket {bucket_index} in {} contains a negative chunk size at slot {chunk_index}",
-                            path.display()
-                        ));
+                        diagnostics.push(
+                            Diagnostic::warning(
+                                DiagnosticCode::InvalidMetadata,
+                                format!(
+                                    "linear_v3 bucket {bucket_index} contains a negative chunk size at slot {chunk_index}"
+                                ),
+                            )
+                            .with_path(path)
+                            .with_region_coords(region_x, region_z)
+                            .with_chunk_index(chunk_index),
+                        );
                         bucket_valid = false;
                         break;
                     }
@@ -326,10 +370,17 @@ fn read_modern_region(
                     let payload_end = payload_start + raw_len;
 
                     if payload_end > decompressed.len() {
-                        warnings.push(format!(
-                            "linear_v3 bucket {bucket_index} in {} overruns its buffer at slot {chunk_index}",
-                            path.display()
-                        ));
+                        diagnostics.push(
+                            Diagnostic::warning(
+                                DiagnosticCode::SkippedData,
+                                format!(
+                                    "linear_v3 bucket {bucket_index} overruns its buffer at slot {chunk_index}"
+                                ),
+                            )
+                            .with_path(path)
+                            .with_region_coords(region_x, region_z)
+                            .with_chunk_index(chunk_index),
+                        );
                         bucket_valid = false;
                         break;
                     }
@@ -350,10 +401,16 @@ fn read_modern_region(
             }
 
             if bucket_valid && local.position() as usize != decompressed.len() {
-                warnings.push(format!(
-                    "linear_v3 bucket {bucket_index} in {} has trailing bytes after its chunk slots",
-                    path.display()
-                ));
+                diagnostics.push(
+                    Diagnostic::warning(
+                        DiagnosticCode::SkippedData,
+                        format!(
+                            "linear_v3 bucket {bucket_index} has trailing bytes after its chunk slots"
+                        ),
+                    )
+                    .with_path(path)
+                    .with_region_coords(region_x, region_z),
+                );
             }
         }
     }
@@ -366,27 +423,40 @@ fn read_modern_region(
     );
 
     if cursor.position() as usize != footer_offset {
-        warnings.push(format!(
-            "linear_v3 {} has {} bytes between the bucket stream and footer",
-            path.display(),
-            footer_offset.saturating_sub(cursor.position() as usize)
-        ));
+        diagnostics.push(
+            Diagnostic::warning(
+                DiagnosticCode::SkippedData,
+                format!(
+                    "linear_v3 has {} bytes between the bucket stream and footer",
+                    footer_offset.saturating_sub(cursor.position() as usize)
+                ),
+            )
+            .with_path(path)
+            .with_region_coords(region_x, region_z),
+        );
     }
 
     for index in 0..REGION_CHUNK_COUNT {
         let bitmap_present = bitmap_contains(&existence_bitmap, index);
         let actual_present = region.chunk(index).is_some();
         if bitmap_present && !actual_present {
-            warnings.push(format!(
-                "linear_v3 header bitmap marks chunk slot {index} as present in {}, but no payload was decoded",
-                path.display()
-            ));
+            diagnostics.push(
+                Diagnostic::warning(
+                    DiagnosticCode::FormatMismatch,
+                    format!(
+                        "linear_v3 header bitmap marks chunk slot {index} as present, but no payload was decoded"
+                    ),
+                )
+                .with_path(path)
+                .with_region_coords(region_x, region_z)
+                .with_chunk_index(index),
+            );
         }
     }
 
     Ok(ReadOutcome {
         region,
-        warnings,
+        diagnostics,
         discarded_chunks: 0,
     })
 }
@@ -454,7 +524,7 @@ fn encode_modern_region(region: &Region, compression_level: i32) -> Result<Encod
     Ok(EncodedRegion {
         main_file_bytes,
         sidecar_files: Vec::new(),
-        warnings: Vec::new(),
+        diagnostics: Vec::new(),
     })
 }
 
@@ -521,7 +591,7 @@ mod tests {
 
         let reparsed = read_region(&output_file)?;
         assert_eq!(reparsed.region, region);
-        assert!(reparsed.warnings.is_empty());
+        assert!(reparsed.diagnostics.is_empty());
         Ok(())
     }
 }

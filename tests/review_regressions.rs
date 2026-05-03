@@ -8,7 +8,7 @@ use tempfile::tempdir;
 use region_converter::cli::{Cli, SourceFormatArg, TargetFormatArg};
 use region_converter::convert::run;
 use region_converter::discovery::discover_jobs;
-use region_converter::formats::{RegionFormat, encode_region};
+use region_converter::formats::{RegionFormat, SourceFormatHint, encode_region};
 use region_converter::info::inspect;
 use region_converter::model::{ChunkData, Region};
 
@@ -144,7 +144,7 @@ fn multi_input_mounts_do_not_collide_when_trailing_paths_match() -> Result<()> {
     let jobs = discover_jobs(
         &[input_a.clone(), input_b.clone()],
         &output_root,
-        Some(RegionFormat::Mca),
+        Some(SourceFormatHint::Mca),
         RegionFormat::Linear,
     )?;
 
@@ -176,13 +176,13 @@ fn directory_mounts_remain_unique_across_separate_runs() -> Result<()> {
     let jobs_a = discover_jobs(
         std::slice::from_ref(&input_a),
         &output_root,
-        Some(RegionFormat::Mca),
+        Some(SourceFormatHint::Mca),
         RegionFormat::Linear,
     )?;
     let jobs_b = discover_jobs(
         std::slice::from_ref(&input_b),
         &output_root,
-        Some(RegionFormat::Mca),
+        Some(SourceFormatHint::Mca),
         RegionFormat::Linear,
     )?;
 
@@ -213,7 +213,7 @@ fn mca_overwrite_is_rejected_when_existing_destination_uses_external_sidecars() 
     let mapped_output_dir = discover_jobs(
         std::slice::from_ref(&input_dir),
         &output_dir,
-        Some(RegionFormat::Mca),
+        Some(SourceFormatHint::Mca),
         RegionFormat::Mca,
     )?[0]
         .destination_file
@@ -297,7 +297,7 @@ fn single_region_file_inputs_write_directly_under_output_root() -> Result<()> {
     let jobs = discover_jobs(
         &[input_file.clone()],
         &output_root,
-        Some(RegionFormat::Mca),
+        Some(SourceFormatHint::Mca),
         RegionFormat::Linear,
     )?;
 

@@ -1,11 +1,18 @@
-# region_converter
+# Region Converter
 
 Rust command-line tool for converting Minecraft Java Edition region saves between:
 
 - `mca` (`.mca`)
+  > Minecraft's default save format, supported by all servers.
+
 - `linear` (`.linear`)
+  > A compressed format, supported by [LinearPurpur](https://github.com/StupidCraft/LinearPurpur), [Kaiiju](https://github.com/KaiijuMC/Kaiiju), [LeavesMC](https://github.com/LeavesMC/Leaves) and [Luminol](https://github.com/LuminolMC/Luminol).
+
 - `blinear_v2` (`.b_linear`)
+  > The next-generation compression format, a reimplemented linear, created by [Luminol](https://github.com/LuminolMC/Luminol).
+
 - `blinear_v3` (`.b_linear`)
+  > The third generation of blinear, supported by [Luminol](https://github.com/LuminolMC/Luminol), provides better performance and stability.
 
 ## Features
 
@@ -162,3 +169,10 @@ If it does not, the converter searches recursively and treats the input as a wor
 - Broken chunks are skipped with warnings when the format has enough structure to recover the rest of the region.
 - Broken whole-region payloads fail that region file and leave other region files running.
 - The process exits with a non-zero status if warnings or errors were encountered.
+
+## Notes
+
+- `linear` input compatibility covers classic linear v1/v2 and the newer linear v3 layout from the referenced server implementation.
+- `linear` output is written as linear v3.
+- `blinear_v2` and `blinear_v3` are implemented from the referenced server-side format behavior and validated against the sample files.
+
