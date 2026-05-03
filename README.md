@@ -10,12 +10,15 @@ Rust command-line tool for converting Minecraft Java Edition region saves betwee
 ## Features
 
 - Parallel conversion with a configurable worker count
-- Automatic use of all available CPU threads when `--threads` is not set
+- Automatic use of available CPU threads when `--threads` is not set, capped to the discovered region-file count to avoid idle workers
 - Compression level control for compressed target formats
 - Works on Windows and Linux
 - Skips corrupted chunks when the format allows chunk-level recovery
 - Fails corrupted whole-region inputs without producing partial garbage
 - Accepts one or more world directories or region directories
+- Prints a concise conversion summary before work starts
+- Shows live progress in a single line with completed regions, successful chunks, discarded chunks, warning counts, and chunk throughput
+- Writes each completed region file to the output path immediately instead of waiting for the whole batch to finish
 
 ## Build
 
@@ -27,7 +30,7 @@ cargo build --release
 
 ```bash
 cargo run --release -- \
-  --to blinear_v3 \
+  --to blinear-v3 \
   --output /path/to/output \
   /path/to/world
 ```
@@ -48,7 +51,7 @@ Convert a world directory to `blinear_v3`:
 
 ```bash
 cargo run --release -- \
-  --to blinear_v3 \
+  --to blinear-v3 \
   --output /data/out/world \
   /data/world
 ```
@@ -69,11 +72,29 @@ Convert with a fixed source format instead of auto-detection:
 
 ```bash
 cargo run --release -- \
-  --from blinear_v2 \
+  --from blinear-v2 \
   --to linear \
   --output /data/out \
   /data/world
 ```
+
+## Runtime output
+
+Before conversion starts, the CLI prints:
+
+- input paths
+- output path
+- source-format mode and target format
+- effective worker-thread count
+- compression level
+- total region-file count
+
+During conversion, the CLI shows live progress including:
+
+- completed region files versus total region files
+- successful chunk count and discarded chunk count
+- warnings seen so far
+- chunks per second
 
 ## Compression levels
 
@@ -109,3 +130,8 @@ For multiple inputs:
 - Broken chunks are skipped with warnings when the format has enough structure to recover the rest of the region.
 - Broken whole-region payloads fail that region file and leave other region files running.
 - The process exits with a non-zero status if warnings or errors were encountered.
+
+## Notes
+
+- `linear` support targets the classic linear v1/v2 layout used by the Python reference converter.
+- `blinear_v2` and `blinear_v3` are implemented from the referenced server-side format behavior and validated against the sample files in `reference/`.

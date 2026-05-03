@@ -18,13 +18,42 @@ pub struct Job {
     pub destination_file: PathBuf,
 }
 
+#[derive(Clone, Debug)]
+pub struct DiscoveryResult {
+    pub jobs: Vec<Job>,
+    pub summary: DiscoverySummary,
+}
+
+#[derive(Clone, Debug)]
+pub struct DiscoverySummary {
+    pub inputs: Vec<InputDiscovery>,
+    pub total_region_directories: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct InputDiscovery {
+    pub input_path: PathBuf,
+    pub discovered_jobs: usize,
+    pub region_directories: usize,
+}
+
 pub fn discover_jobs(
     inputs: &[PathBuf],
     output_root: &Path,
     forced_format: Option<RegionFormat>,
     target_format: RegionFormat,
 ) -> Result<Vec<Job>> {
+    Ok(discover_jobs_with_summary(inputs, output_root, forced_format, target_format)?.jobs)
+}
+
+pub fn discover_jobs_with_summary(
+    inputs: &[PathBuf],
+    output_root: &Path,
+    forced_format: Option<RegionFormat>,
+    target_format: RegionFormat,
+) -> Result<DiscoveryResult> {
     let mut jobs = Vec::new();
+    let mut input_summaries = Vec::new();
     let multiple_inputs = inputs.len() > 1;
     let normalized_output_root = normalize_path_for_compare(output_root);
 
@@ -38,6 +67,7 @@ pub fn discover_jobs(
 
         let direct_files = supported_region_files_in_dir(input)?;
         if !direct_files.is_empty() {
+            let discovered_jobs = direct_files.len();
             let destination_dir = if multiple_inputs {
                 output_root.join(mount_label(input))
             } else {
@@ -50,6 +80,11 @@ pub fn discover_jobs(
                 forced_format,
                 target_format,
             )?;
+            input_summaries.push(InputDiscovery {
+                input_path: input.clone(),
+                discovered_jobs,
+                region_directories: 1,
+            });
             continue;
         }
 
@@ -88,6 +123,9 @@ pub fn discover_jobs(
             );
         }
 
+        let region_directories = region_dirs.len();
+        let job_start = jobs.len();
+
         let root_mount = if multiple_inputs {
             output_root.join(mount_label(input))
         } else {
@@ -103,6 +141,12 @@ pub fn discover_jobs(
                 target_format,
             )?;
         }
+
+        input_summaries.push(InputDiscovery {
+            input_path: input.clone(),
+            discovered_jobs: jobs.len() - job_start,
+            region_directories,
+        });
     }
 
     if jobs.is_empty() {
@@ -127,7 +171,18 @@ pub fn discover_jobs(
     }
 
     jobs.sort_by(|left, right| left.source_file.cmp(&right.source_file));
-    Ok(jobs)
+    let total_region_directories = input_summaries
+        .iter()
+        .map(|summary| summary.region_directories)
+        .sum();
+
+    Ok(DiscoveryResult {
+        jobs,
+        summary: DiscoverySummary {
+            inputs: input_summaries,
+            total_region_directories,
+        },
+    })
 }
 
 fn append_jobs(

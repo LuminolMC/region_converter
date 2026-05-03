@@ -184,3 +184,28 @@ fn mca_overwrite_is_rejected_when_existing_destination_uses_external_sidecars() 
     }
     Ok(())
 }
+
+#[test]
+fn worker_threads_are_capped_to_discovered_region_files() -> Result<()> {
+    let temp_dir = tempdir()?;
+    let input_dir = temp_dir.path().join("input");
+    let output_dir = temp_dir.path().join("output");
+
+    copy_reference_file(
+        "reference/minecraft_world_trimmer_mca/test_files/r.-1.-1.mca",
+        &input_dir.join("r.-1.-1.mca"),
+    )?;
+
+    let summary = run(Cli {
+        inputs: vec![input_dir],
+        output: output_dir,
+        from: SourceFormatArg::Mca,
+        to: TargetFormatArg::Linear,
+        threads: Some(64),
+        compression_level: None,
+    })?;
+
+    assert_eq!(summary.total_jobs, 1);
+    assert_eq!(summary.thread_count, 1);
+    Ok(())
+}
