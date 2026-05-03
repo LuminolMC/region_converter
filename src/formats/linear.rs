@@ -6,8 +6,8 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::formats::{
-    EncodedRegion, LINEAR_SUPERBLOCK, ReadOutcome, RegionStorageFormat,
-    parse_region_coords_from_path, xxhash64,
+    EncodedRegion, LINEAR_SUPERBLOCK, ReadOutcome, RegionStorageFormat, newest_timestamp_seconds,
+    normalize_timestamp_to_seconds, parse_region_coords_from_path, xxhash64,
 };
 use crate::io_util::read_file_bytes;
 use crate::model::{ChunkData, REGION_CHUNK_COUNT, Region};
@@ -478,8 +478,9 @@ fn encode_modern_region(region: &Region, compression_level: i32) -> Result<Encod
                     if let Some(chunk) = region.chunk(chunk_index) {
                         let chunk_len = i32::try_from(chunk.raw_nbt.len())
                             .context("linear_v3 chunk payload is too large")?;
+                        let timestamp = normalize_timestamp_to_seconds(chunk.timestamp);
                         raw_bucket.write_i32::<BigEndian>(chunk_len + 8)?;
-                        raw_bucket.write_i64::<BigEndian>(chunk.timestamp)?;
+                        raw_bucket.write_i64::<BigEndian>(timestamp)?;
                         raw_bucket.extend_from_slice(&chunk.raw_nbt);
                         has_data = true;
                     } else {
@@ -511,7 +512,7 @@ fn encode_modern_region(region: &Region, compression_level: i32) -> Result<Encod
     let mut main_file_bytes = Vec::new();
     main_file_bytes.write_u64::<BigEndian>(LINEAR_SUPERBLOCK)?;
     main_file_bytes.write_u8(MODERN_VERSION)?;
-    main_file_bytes.write_i64::<BigEndian>(region.newest_timestamp().max(0))?;
+    main_file_bytes.write_i64::<BigEndian>(newest_timestamp_seconds(region).max(0))?;
     main_file_bytes.write_u8(MODERN_GRID_SIZE as u8)?;
     main_file_bytes.write_i32::<BigEndian>(region.region_x)?;
     main_file_bytes.write_i32::<BigEndian>(region.region_z)?;

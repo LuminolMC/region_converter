@@ -7,7 +7,7 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::formats::{
     BLINEAR_HASH_SEED, BLINEAR_SUPERBLOCK, EncodedRegion, ReadOutcome, decode_chunk_section,
-    encode_chunk_section, parse_region_coords_from_path,
+    encode_chunk_section, newest_timestamp_millis, parse_region_coords_from_path,
 };
 use crate::io_util::read_file_bytes;
 use crate::model::{REGION_CHUNK_COUNT, Region};
@@ -139,7 +139,7 @@ pub fn encode_region(region: &Region, compression_level: i32) -> Result<EncodedR
     let mut main_file_bytes = Vec::with_capacity(HEADER_SIZE + compressed.len());
     main_file_bytes.write_i64::<BigEndian>(BLINEAR_SUPERBLOCK)?;
     main_file_bytes.write_u8(0x02)?;
-    main_file_bytes.write_i64::<BigEndian>(region.newest_timestamp())?;
+    main_file_bytes.write_i64::<BigEndian>(newest_timestamp_millis(region))?;
     main_file_bytes.write_u8(compression_level as u8)?;
     main_file_bytes.extend_from_slice(&compressed);
 

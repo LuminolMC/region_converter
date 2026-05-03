@@ -19,6 +19,8 @@ use crate::model::{ChunkData, Region};
 pub const BLINEAR_SUPERBLOCK: i64 = -0x2008_1225_0269;
 pub const LINEAR_SUPERBLOCK: u64 = 0xc3ff_1318_3cca_9d9a;
 pub const BLINEAR_HASH_SEED: u32 = 0x0721;
+// Current second timestamps are ~1e9, while millisecond timestamps are ~1e12.
+const MILLIS_TIMESTAMP_THRESHOLD: i64 = 10_000_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum RegionFormat {
@@ -317,13 +319,30 @@ pub(crate) fn decode_chunk_section(section: &[u8], hash_seed: u32) -> Result<Chu
 pub(crate) fn encode_chunk_section(chunk: &ChunkData, hash_seed: u32) -> Result<Vec<u8>> {
     let raw_len = i32::try_from(chunk.raw_nbt.len()).context("chunk payload is too large")?;
     let hash = xxhash32(hash_seed, &chunk.raw_nbt);
+    let timestamp = normalize_timestamp_to_millis(chunk.timestamp);
 
     let mut section = Vec::with_capacity(16 + chunk.raw_nbt.len());
     section.extend_from_slice(&raw_len.to_be_bytes());
-    section.extend_from_slice(&chunk.timestamp.to_be_bytes());
+    section.extend_from_slice(&timestamp.to_be_bytes());
     section.extend_from_slice(&hash.to_be_bytes());
     section.extend_from_slice(&chunk.raw_nbt);
     Ok(section)
+}
+
+pub(crate) fn normalize_timestamp_to_millis(timestamp: i64) -> i64 {
+    if timestamp > 0 && timestamp < MILLIS_TIMESTAMP_THRESHOLD {
+        timestamp.saturating_mul(1000)
+    } else {
+        timestamp
+    }
+}
+
+pub(crate) fn normalize_timestamp_to_seconds(timestamp: i64) -> i64 {
+    if timestamp >= MILLIS_TIMESTAMP_THRESHOLD {
+        timestamp / 1000
+    } else {
+        timestamp
+    }
 }
 
 pub(crate) fn normalize_timestamp_to_u32(timestamp: i64) -> (u32, bool) {
@@ -341,6 +360,22 @@ pub(crate) fn normalize_timestamp_to_u32(timestamp: i64) -> (u32, bool) {
     }
 
     (u32::MAX, true)
+}
+
+pub(crate) fn newest_timestamp_millis(region: &Region) -> i64 {
+    region
+        .iter_chunks()
+        .map(|(_, chunk)| normalize_timestamp_to_millis(chunk.timestamp))
+        .max()
+        .unwrap_or(0)
+}
+
+pub(crate) fn newest_timestamp_seconds(region: &Region) -> i64 {
+    region
+        .iter_chunks()
+        .map(|(_, chunk)| normalize_timestamp_to_seconds(chunk.timestamp))
+        .max()
+        .unwrap_or(0)
 }
 
 pub(crate) fn xxhash32(seed: u32, bytes: &[u8]) -> u32 {
