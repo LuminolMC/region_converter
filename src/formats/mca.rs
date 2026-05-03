@@ -126,6 +126,42 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
     })
 }
 
+pub fn region_uses_external_chunks(path: &Path) -> Result<bool> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    ensure!(
+        bytes.len() >= MCA_HEADER_SIZE,
+        "mca region {} is smaller than the 8 KiB header",
+        path.display()
+    );
+
+    for index in 0..REGION_CHUNK_COUNT {
+        let location_offset = index * 4;
+        let location = u32::from_be_bytes(
+            bytes[location_offset..location_offset + 4]
+                .try_into()
+                .unwrap(),
+        );
+
+        let sector_index = ((location >> 8) & 0x00ff_ffff) as usize;
+        let sector_count = (location & 0xff) as usize;
+        if sector_index == 0 || sector_count == 0 {
+            continue;
+        }
+
+        let chunk_offset = sector_index * MCA_SECTOR_SIZE;
+        if chunk_offset + 5 > bytes.len() {
+            continue;
+        }
+
+        if bytes[chunk_offset + 4] & MCA_EXTERNAL_FLAG != 0 {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 pub fn encode_region(region: &Region, compression_level: i32) -> Result<EncodedRegion> {
     let mut location_table = vec![0_u8; 4096];
     let mut timestamp_table = vec![0_u8; 4096];

@@ -21,6 +21,7 @@ pub const BLINEAR_HASH_SEED: u32 = 0x0721;
 pub enum RegionFormat {
     Mca,
     Linear,
+    Blinear,
     BlinearV2,
     BlinearV3,
 }
@@ -50,7 +51,7 @@ impl RegionFormat {
         match self {
             Self::Mca => "mca",
             Self::Linear => "linear",
-            Self::BlinearV2 | Self::BlinearV3 => "b_linear",
+            Self::Blinear | Self::BlinearV2 | Self::BlinearV3 => "b_linear",
         }
     }
 
@@ -61,7 +62,7 @@ impl RegionFormat {
     pub fn default_compression_level(self) -> i32 {
         match self {
             Self::Mca => 6,
-            Self::Linear | Self::BlinearV2 | Self::BlinearV3 => 6,
+            Self::Linear | Self::Blinear | Self::BlinearV2 | Self::BlinearV3 => 6,
         }
     }
 }
@@ -71,9 +72,19 @@ impl Display for RegionFormat {
         match self {
             Self::Mca => f.write_str("mca"),
             Self::Linear => f.write_str("linear"),
+            Self::Blinear => f.write_str("blinear"),
             Self::BlinearV2 => f.write_str("blinear_v2"),
             Self::BlinearV3 => f.write_str("blinear_v3"),
         }
+    }
+}
+
+pub fn guess_format_from_path(path: &Path) -> Result<RegionFormat> {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("mca") => Ok(RegionFormat::Mca),
+        Some("linear") => Ok(RegionFormat::Linear),
+        Some("b_linear") => Ok(RegionFormat::Blinear),
+        _ => bail!("unsupported region file extension for {}", path.display()),
     }
 }
 
@@ -86,10 +97,15 @@ pub fn detect_format(path: &Path) -> Result<RegionFormat> {
     }
 }
 
+pub fn region_uses_external_chunks(path: &Path) -> Result<bool> {
+    mca::region_uses_external_chunks(path)
+}
+
 pub fn read_region(path: &Path, format: RegionFormat) -> Result<ReadOutcome> {
     match format {
         RegionFormat::Mca => mca::read_region(path),
         RegionFormat::Linear => linear::read_region(path),
+        RegionFormat::Blinear => read_region(path, detect_format(path)?),
         RegionFormat::BlinearV2 => blinear_v2::read_region(path),
         RegionFormat::BlinearV3 => blinear_v3::read_region(path),
     }
@@ -103,6 +119,9 @@ pub fn encode_region(
     match format {
         RegionFormat::Mca => mca::encode_region(region, compression_level),
         RegionFormat::Linear => linear::encode_region(region, compression_level),
+        RegionFormat::Blinear => {
+            bail!("generic blinear format is only valid as an input placeholder")
+        }
         RegionFormat::BlinearV2 => blinear_v2::encode_region(region, compression_level),
         RegionFormat::BlinearV3 => blinear_v3::encode_region(region, compression_level),
     }

@@ -7,7 +7,8 @@ use anyhow::{Context, Result, bail};
 use walkdir::WalkDir;
 
 use crate::formats::{
-    RegionFormat, detect_format, looks_like_region_file, parse_region_coords_from_path,
+    RegionFormat, guess_format_from_path, looks_like_region_file, parse_region_coords_from_path,
+    xxhash32,
 };
 
 #[derive(Clone, Debug)]
@@ -25,6 +26,7 @@ pub fn discover_jobs(
 ) -> Result<Vec<Job>> {
     let mut jobs = Vec::new();
     let multiple_inputs = inputs.len() > 1;
+    let normalized_output_root = normalize_path_for_compare(output_root);
 
     for input in inputs {
         if !input.is_dir() {
@@ -55,6 +57,9 @@ pub fn discover_jobs(
         for entry in WalkDir::new(input)
             .follow_links(false)
             .into_iter()
+            .filter_entry(|entry| {
+                !should_skip_recursive_entry(entry.path(), input, &normalized_output_root)
+            })
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().is_dir())
         {
@@ -135,7 +140,7 @@ fn append_jobs(
     for source_file in files {
         let source_format = match forced_format {
             Some(format) => format,
-            None => detect_format(source_file)?,
+            None => guess_format_from_path(source_file)?,
         };
         let (region_x, region_z) = parse_region_coords_from_path(source_file)?;
         let destination_file =
@@ -167,20 +172,57 @@ fn supported_region_files_in_dir(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn mount_label(path: &Path) -> String {
-    let mut components = path
+    let normalized = normalize_path_for_compare(path);
+    let mut components = normalized
         .components()
         .filter_map(component_name)
         .collect::<Vec<_>>();
 
-    if components.is_empty() {
-        return "input".to_string();
-    }
+    let tail = if components.is_empty() {
+        "input".to_string()
+    } else {
+        if components.len() > 3 {
+            components = components.split_off(components.len() - 3);
+        }
 
-    if components.len() > 3 {
-        components = components.split_off(components.len() - 3);
-    }
+        components.join("__")
+    };
 
-    components.join("__")
+    let hash = xxhash32(0, normalized.to_string_lossy().as_bytes());
+    format!("{tail}__{hash:08x}")
+}
+
+fn should_skip_recursive_entry(
+    candidate: &Path,
+    input_root: &Path,
+    normalized_output_root: &Path,
+) -> bool {
+    candidate != input_root
+        && normalize_path_for_compare(candidate).starts_with(normalized_output_root)
+}
+
+fn normalize_path_for_compare(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
 }
 
 fn component_name(component: Component<'_>) -> Option<String> {
@@ -207,5 +249,40 @@ fn sanitize_component(value: &OsStr) -> Option<String> {
         None
     } else {
         Some(cleaned)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mount_labels_include_a_hash_for_collision_resistance() {
+        let left = mount_label(Path::new("/a/archive/world"));
+        let right = mount_label(Path::new("/b/archive/world"));
+        assert_ne!(left, right);
+    }
+
+    #[test]
+    fn output_subtrees_are_skipped_during_recursive_scans() {
+        let input = Path::new("/tmp/world");
+        let output = normalize_path_for_compare(Path::new("/tmp/world/out"));
+
+        assert!(!should_skip_recursive_entry(input, input, &output));
+        assert!(should_skip_recursive_entry(
+            Path::new("/tmp/world/out"),
+            input,
+            &output
+        ));
+        assert!(should_skip_recursive_entry(
+            Path::new("/tmp/world/out/region"),
+            input,
+            &output
+        ));
+        assert!(!should_skip_recursive_entry(
+            Path::new("/tmp/world/DIM1/region"),
+            input,
+            &output
+        ));
     }
 }

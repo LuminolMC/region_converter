@@ -102,6 +102,9 @@ impl Cli {
                     bail!("mca compression level must be in the range 0..=9");
                 }
             }
+            RegionFormat::Blinear => {
+                bail!("generic blinear placeholder cannot be used as a target format");
+            }
             RegionFormat::Linear | RegionFormat::BlinearV2 | RegionFormat::BlinearV3 => {
                 if !(1..=22).contains(&level) {
                     bail!("linear and blinear compression levels must be in the range 1..=22");

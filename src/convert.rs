@@ -1,12 +1,12 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 
 use crate::cli::Cli;
 use crate::discovery::{Job, discover_jobs};
-use crate::formats::{RegionFormat, encode_region, read_region};
+use crate::formats::{RegionFormat, encode_region, read_region, region_uses_external_chunks};
 use crate::io_util::atomic_write;
 
 #[derive(Debug)]
@@ -117,7 +117,7 @@ fn process_job(job: &Job, target_format: RegionFormat, compression_level: i32) -
         Ok(success) => JobReport::Success(JobSuccess {
             source_file,
             destination_file,
-            source_format: job.source_format,
+            source_format: success.source_format,
             target_format,
             chunk_count: success.chunk_count,
             discarded_chunks: success.discarded_chunks,
@@ -138,7 +138,12 @@ fn try_process_job(
     target_format: RegionFormat,
     compression_level: i32,
 ) -> Result<ProcessedJob> {
-    let mut read = read_region(&job.source_file, job.source_format)
+    let source_format = match job.source_format {
+        RegionFormat::Blinear => crate::formats::detect_format(&job.source_file)?,
+        format => format,
+    };
+
+    let mut read = read_region(&job.source_file, source_format)
         .with_context(|| format!("failed to decode {}", job.source_file.display()))?;
     let chunk_count = read.region.chunk_count();
 
@@ -151,7 +156,7 @@ fn try_process_job(
             )
         })?;
 
-    write_encoded_region(&job.destination_file, &encoded)
+    write_encoded_region(target_format, &job.destination_file, &encoded)
         .with_context(|| format!("failed to write {}", job.destination_file.display()))?;
 
     let mut warnings = Vec::new();
@@ -159,6 +164,7 @@ fn try_process_job(
     warnings.append(&mut encoded.warnings);
 
     Ok(ProcessedJob {
+        source_format,
         chunk_count,
         discarded_chunks: read.discarded_chunks,
         warnings,
@@ -166,12 +172,24 @@ fn try_process_job(
 }
 
 fn write_encoded_region(
+    target_format: RegionFormat,
     destination_file: &Path,
     encoded: &crate::formats::EncodedRegion,
 ) -> Result<()> {
     let destination_dir = destination_file
         .parent()
         .context("destination file does not have a parent directory")?;
+
+    if target_format == RegionFormat::Mca
+        && !encoded.sidecar_files.is_empty()
+        && destination_file.exists()
+        && region_uses_external_chunks(destination_file)?
+    {
+        bail!(
+            "refusing to overwrite {} because it already uses external .mcc chunks and replacing the sidecars plus header atomically is not currently safe",
+            destination_file.display()
+        );
+    }
 
     for sidecar in &encoded.sidecar_files {
         atomic_write(&destination_dir.join(&sidecar.file_name), &sidecar.bytes)?;
@@ -182,6 +200,7 @@ fn write_encoded_region(
 }
 
 struct ProcessedJob {
+    source_format: RegionFormat,
     chunk_count: usize,
     discarded_chunks: usize,
     warnings: Vec<String>,
