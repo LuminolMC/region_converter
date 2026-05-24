@@ -9,7 +9,7 @@ Rust command-line tool for converting Minecraft Java Edition region saves betwee
   > A compressed format, supported by [LinearPurpur](https://github.com/StupidCraft/LinearPurpur), [Kaiiju](https://github.com/KaiijuMC/Kaiiju), [LeavesMC](https://github.com/LeavesMC/Leaves) and [Luminol](https://github.com/LuminolMC/Luminol).
 
 - `blinear_v2` (`.b_linear`)
-  > The next-generation compression format, a reimplemented linear, created by [Luminol](https://github.com/LuminolMC/Luminol).
+  > The next-generation compression format, a reimplemented linear, provides better compression ratio, created by [Luminol](https://github.com/LuminolMC/Luminol).
 
 - `blinear_v3` (`.b_linear`)
   > The third generation of blinear, supported by [Luminol](https://github.com/LuminolMC/Luminol), provides better performance and stability.
