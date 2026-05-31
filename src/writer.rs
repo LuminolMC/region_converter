@@ -1,6 +1,7 @@
 use std::fs::{self, File};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -23,6 +24,12 @@ pub trait RegionWriteTarget {
     fn write_sidecar_file(&mut self, file_name: &str, bytes: &[u8]) -> Result<()>;
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WriteTransactionProfile {
+    pub prepare: Duration,
+    pub commit: Duration,
+}
+
 pub fn write_region_with_transaction<F>(
     target_format: RegionFormat,
     destination_file: &Path,
@@ -31,12 +38,35 @@ pub fn write_region_with_transaction<F>(
 where
     F: FnOnce(&mut dyn RegionWriteTarget) -> Result<()>,
 {
+    write_region_with_transaction_profiled(target_format, destination_file, None, write_region)
+}
+
+pub fn write_region_with_transaction_profiled<F>(
+    target_format: RegionFormat,
+    destination_file: &Path,
+    mut profile: Option<&mut WriteTransactionProfile>,
+    write_region: F,
+) -> Result<()>
+where
+    F: FnOnce(&mut dyn RegionWriteTarget) -> Result<()>,
+{
+    let prepare_started_at = Instant::now();
     let mut transaction = StreamingOutputTransaction::prepare(target_format, destination_file)?;
+    if let Some(profile) = profile.as_deref_mut() {
+        profile.prepare = prepare_started_at.elapsed();
+    }
+
     if let Err(error) = write_region(&mut transaction) {
         transaction.rollback();
         return Err(error);
     }
-    transaction.commit()
+
+    let commit_started_at = Instant::now();
+    let result = transaction.commit();
+    if let Some(profile) = profile {
+        profile.commit = commit_started_at.elapsed();
+    }
+    result
 }
 
 struct OutputTransaction {

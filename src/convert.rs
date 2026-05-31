@@ -7,11 +7,13 @@ use anyhow::{Result, anyhow};
 use crate::cli::Cli;
 use crate::diagnostic::{Diagnostic, DiagnosticCode, warning_count};
 use crate::discovery::Job;
-use crate::formats::{RegionFormat, SourceFormatHint, decode_region, encode_region_to_writer};
+use crate::formats::{
+    EncodeProfile, RegionFormat, SourceFormatHint, decode_region, encode_region_to_writer_profiled,
+};
 use crate::pipeline::stream_parallel;
 use crate::planner::plan_conversion;
 use crate::runtime::RuntimeResources;
-use crate::writer::write_region_with_transaction;
+use crate::writer::{WriteTransactionProfile, write_region_with_transaction_profiled};
 
 pub use crate::planner::{FormatBreakdown, RunPlan};
 
@@ -51,11 +53,18 @@ pub struct JobProfile {
     pub wait_decode_io: Duration,
     pub wait_write_io: Duration,
     pub decode: Duration,
+    pub encode_compress: Duration,
+    pub encode_other_cpu: Duration,
+    pub encode_file_write: Duration,
+    pub output_commit: Duration,
     pub encode_write: Duration,
     pub total: Duration,
+    pub encoded_units: usize,
+    pub raw_payload_bytes: u64,
+    pub compressed_payload_bytes: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ProfileSummary {
     pub memory_budget_bytes: u64,
     pub estimated_input_bytes: u64,
@@ -63,8 +72,31 @@ pub struct ProfileSummary {
     pub wait_decode_io: Duration,
     pub wait_write_io: Duration,
     pub decode: Duration,
+    pub encode_compress: Duration,
+    pub encode_other_cpu: Duration,
+    pub encode_file_write: Duration,
+    pub output_commit: Duration,
     pub encode_write: Duration,
     pub total_job_time: Duration,
+    pub encoded_units: usize,
+    pub raw_payload_bytes: u64,
+    pub compressed_payload_bytes: u64,
+    pub slowest_jobs: Vec<ProfiledJobSummary>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProfiledJobSummary {
+    pub source_file: PathBuf,
+    pub estimated_size_bytes: u64,
+    pub encoded_units: usize,
+    pub raw_payload_bytes: u64,
+    pub compressed_payload_bytes: u64,
+    pub decode: Duration,
+    pub encode_compress: Duration,
+    pub encode_file_write: Duration,
+    pub output_commit: Duration,
+    pub encode_write: Duration,
+    pub total: Duration,
 }
 
 #[derive(Debug)]
@@ -184,7 +216,15 @@ fn execute_jobs(
     stream_parallel(
         jobs,
         thread_count,
-        move |job| process_job(job, target_format, compression_level, resources.clone()),
+        move |job| {
+            process_job(
+                job,
+                target_format,
+                compression_level,
+                resources.clone(),
+                profile_enabled,
+            )
+        },
         |report| {
             accumulator.apply(&report, started_at.elapsed());
             observer.on_job_report(&report, &accumulator.snapshot)?;
@@ -200,6 +240,7 @@ fn process_job(
     target_format: RegionFormat,
     compression_level: i32,
     resources: RuntimeResources,
+    profile_enabled: bool,
 ) -> JobReport {
     let mut resolved_source_format = hinted_region_format(job.source_format);
     let mut diagnostics = Vec::new();
@@ -236,20 +277,28 @@ fn process_job(
         stage = JobStage::Encode;
         let encode_write_started_at = Instant::now();
         let mut encoded_diagnostics = Vec::new();
+        let mut encode_profile = profile_enabled.then(EncodeProfile::default);
+        let mut transaction_profile = WriteTransactionProfile::default();
         {
             let wait_started_at = Instant::now();
             let _io_guard = resources.acquire_write_io();
             profile.wait_write_io = wait_started_at.elapsed();
             stage = JobStage::Write;
-            write_region_with_transaction(target_format, &job.destination_file, |target| {
-                encoded_diagnostics = encode_region_to_writer(
-                    &decoded.outcome.region,
-                    target_format,
-                    compression_level,
-                    target,
-                )?;
-                Ok(())
-            })
+            write_region_with_transaction_profiled(
+                target_format,
+                &job.destination_file,
+                profile_enabled.then_some(&mut transaction_profile),
+                |target| {
+                    encoded_diagnostics = encode_region_to_writer_profiled(
+                        &decoded.outcome.region,
+                        target_format,
+                        compression_level,
+                        target,
+                        encode_profile.as_mut(),
+                    )?;
+                    Ok(())
+                },
+            )
             .map_err(|error| {
                 anyhow!(
                     "failed to encode and write {} as {}: {error:#}",
@@ -259,6 +308,21 @@ fn process_job(
             })?;
         }
         profile.encode_write = encode_write_started_at.elapsed();
+        if let Some(encode_profile) = encode_profile {
+            profile.encode_compress = encode_profile.compress;
+            profile.encode_file_write = encode_profile.file_write;
+            profile.encoded_units = encode_profile.encoded_units;
+            profile.raw_payload_bytes = encode_profile.raw_payload_bytes;
+            profile.compressed_payload_bytes = encode_profile.compressed_payload_bytes;
+        }
+        if profile_enabled {
+            profile.output_commit = transaction_profile.commit;
+            let accounted = profile
+                .encode_compress
+                .saturating_add(profile.encode_file_write)
+                .saturating_add(profile.output_commit);
+            profile.encode_other_cpu = profile.encode_write.saturating_sub(accounted);
+        }
         diagnostics.append(&mut encoded_diagnostics);
 
         Ok(chunk_count)
@@ -288,7 +352,6 @@ fn process_job(
         }),
     }
 }
-
 fn hinted_region_format(hint: SourceFormatHint) -> Option<RegionFormat> {
     match hint {
         SourceFormatHint::Mca => Some(RegionFormat::Mca),
@@ -404,13 +467,13 @@ impl SummaryAccumulator {
                 self.total_discarded_chunks += report.discarded_chunks;
                 self.total_warnings += warning_count(&report.diagnostics);
                 completed_chunks = report.chunk_count;
-                self.apply_profile(report.profile);
+                self.apply_profile(&report.source_file, report.profile);
             }
             JobReport::Failure(report) => {
                 self.failed_jobs += 1;
                 self.total_discarded_chunks += report.discarded_chunks;
                 self.total_warnings += warning_count(&report.diagnostics);
-                self.apply_profile(report.profile);
+                self.apply_profile(&report.source_file, report.profile);
             }
         }
 
@@ -430,7 +493,7 @@ impl SummaryAccumulator {
         };
     }
 
-    fn apply_profile(&mut self, profile: JobProfile) {
+    fn apply_profile(&mut self, source_file: &Path, profile: JobProfile) {
         let Some(summary) = self.profile.as_mut() else {
             return;
         };
@@ -439,8 +502,32 @@ impl SummaryAccumulator {
         summary.wait_decode_io += profile.wait_decode_io;
         summary.wait_write_io += profile.wait_write_io;
         summary.decode += profile.decode;
+        summary.encode_compress += profile.encode_compress;
+        summary.encode_other_cpu += profile.encode_other_cpu;
+        summary.encode_file_write += profile.encode_file_write;
+        summary.output_commit += profile.output_commit;
         summary.encode_write += profile.encode_write;
         summary.total_job_time += profile.total;
+        summary.encoded_units += profile.encoded_units;
+        summary.raw_payload_bytes += profile.raw_payload_bytes;
+        summary.compressed_payload_bytes += profile.compressed_payload_bytes;
+        summary.slowest_jobs.push(ProfiledJobSummary {
+            source_file: source_file.to_path_buf(),
+            estimated_size_bytes: profile.estimated_size_bytes,
+            encoded_units: profile.encoded_units,
+            raw_payload_bytes: profile.raw_payload_bytes,
+            compressed_payload_bytes: profile.compressed_payload_bytes,
+            decode: profile.decode,
+            encode_compress: profile.encode_compress,
+            encode_file_write: profile.encode_file_write,
+            output_commit: profile.output_commit,
+            encode_write: profile.encode_write,
+            total: profile.total,
+        });
+        summary
+            .slowest_jobs
+            .sort_by(|left, right| right.encode_write.cmp(&left.encode_write));
+        summary.slowest_jobs.truncate(5);
     }
 
     fn recent_chunk_rate(&mut self, elapsed: Duration) -> f64 {

@@ -155,8 +155,8 @@ impl RunObserver for ConsoleReporter {
             summary.total_discarded_chunks,
             summary.total_warnings
         );
-        if let Some(profile) = summary.profile {
-            print_profile_summary(&profile);
+        if let Some(profile) = &summary.profile {
+            print_profile_summary(profile, summary.elapsed, summary.thread_count);
         }
         io::stdout().flush()?;
         Ok(())
@@ -218,7 +218,13 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn print_profile_summary(profile: &ProfileSummary) {
+fn print_profile_summary(profile: &ProfileSummary, elapsed: Duration, thread_count: usize) {
+    let effective_workers = if elapsed.as_secs_f64() > 0.0 {
+        profile.total_job_time.as_secs_f64() / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+
     println!("Profile:");
     println!(
         "  Estimated input: {} | Memory budget: {}",
@@ -237,6 +243,40 @@ fn print_profile_summary(profile: &ProfileSummary) {
         format_duration_precise(profile.encode_write),
         format_duration_precise(profile.total_job_time)
     );
+    println!(
+        "  Parallelism: wall {} | effective {:.2}/{} workers",
+        format_duration_precise(elapsed),
+        effective_workers,
+        thread_count
+    );
+    println!(
+        "  Encode detail: compress {} | format cpu {} | file write {} | commit {}",
+        format_duration_precise(profile.encode_compress),
+        format_duration_precise(profile.encode_other_cpu),
+        format_duration_precise(profile.encode_file_write),
+        format_duration_precise(profile.output_commit)
+    );
+    println!(
+        "  Encoded payload: units {} | raw {} | compressed {}",
+        profile.encoded_units,
+        format_bytes(profile.raw_payload_bytes),
+        format_bytes(profile.compressed_payload_bytes)
+    );
+    if !profile.slowest_jobs.is_empty() {
+        println!("  Slowest regions:");
+        for job in &profile.slowest_jobs {
+            println!(
+                "    {} | input {} | units {} | decode {} | compress {} | write {} | total {}",
+                job.source_file.display(),
+                format_bytes(job.estimated_size_bytes),
+                job.encoded_units,
+                format_duration_precise(job.decode),
+                format_duration_precise(job.encode_compress),
+                format_duration_precise(job.encode_file_write + job.output_commit),
+                format_duration_precise(job.total)
+            );
+        }
+    }
 }
 
 fn format_duration_precise(duration: Duration) -> String {

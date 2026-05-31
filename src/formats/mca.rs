@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
 use byteorder::{BigEndian, WriteBytesExt};
@@ -11,7 +12,7 @@ use flate2::write::ZlibEncoder;
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::formats::{
-    EncodedRegion, ReadOutcome, SidecarFile, normalize_timestamp_to_u32,
+    EncodeProfile, EncodedRegion, ReadOutcome, SidecarFile, normalize_timestamp_to_u32,
     parse_region_coords_from_path,
 };
 use crate::io_util::read_file_bytes;
@@ -339,19 +340,37 @@ pub fn encode_region_to_writer(
     compression_level: i32,
     target: &mut dyn RegionWriteTarget,
 ) -> Result<Vec<Diagnostic>> {
+    encode_region_to_writer_profiled(region, compression_level, target, None)
+}
+
+pub fn encode_region_to_writer_profiled(
+    region: &Region,
+    compression_level: i32,
+    target: &mut dyn RegionWriteTarget,
+    mut profile: Option<&mut EncodeProfile>,
+) -> Result<Vec<Diagnostic>> {
     let mut location_table = [0_u8; 4096];
     let mut timestamp_table = [0_u8; 4096];
     let mut next_sector = 2_u32;
     let compression = Compression::new(compression_level as u32);
 
     {
+        let write_started_at = Instant::now();
         let main = target.main_file();
         main.write_all(&[0_u8; MCA_HEADER_SIZE])?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.record_file_write(write_started_at.elapsed());
+        }
     }
 
     for (index, chunk) in region.iter_chunks() {
+        let compress_started_at = Instant::now();
         let compressed = zlib_compress(&chunk.raw_nbt, compression)
             .with_context(|| format!("failed to compress chunk slot {index}"))?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.record_compress(compress_started_at.elapsed());
+            profile.record_unit(chunk.raw_nbt.len(), compressed.len());
+        }
 
         let (timestamp, _) = normalize_timestamp_to_u32(chunk.timestamp);
         timestamp_table[index * 4..index * 4 + 4].copy_from_slice(&timestamp.to_be_bytes());
@@ -367,6 +386,7 @@ pub fn encode_region_to_writer(
             pad_to_sector_boundary(&mut record);
             sector_count = 1_u8;
 
+            let write_started_at = Instant::now();
             target.write_sidecar_file(
                 &external_chunk_file_name(
                     region.region_x * REGION_SIDE as i32 + local_x as i32,
@@ -374,8 +394,15 @@ pub fn encode_region_to_writer(
                 ),
                 &compressed,
             )?;
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.record_file_write(write_started_at.elapsed());
+            }
 
+            let write_started_at = Instant::now();
             target.main_file().write_all(&record)?;
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.record_file_write(write_started_at.elapsed());
+            }
         } else {
             let inline_len =
                 u32::try_from(compressed.len() + 1).context("inline chunk payload is too large")?;
@@ -389,7 +416,11 @@ pub fn encode_region_to_writer(
             let sectors = record.len() / MCA_SECTOR_SIZE;
             sector_count =
                 u8::try_from(sectors).context("inline mca chunk requires too many sectors")?;
+            let write_started_at = Instant::now();
             target.main_file().write_all(&record)?;
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.record_file_write(write_started_at.elapsed());
+            }
         }
 
         location_table[index * 4..index * 4 + 4]
@@ -397,11 +428,15 @@ pub fn encode_region_to_writer(
         next_sector += u32::from(sector_count);
     }
 
+    let write_started_at = Instant::now();
     let main = target.main_file();
     main.seek(SeekFrom::Start(0))?;
     main.write_all(&location_table)?;
     main.write_all(&timestamp_table)?;
     main.seek(SeekFrom::End(0))?;
+    if let Some(profile) = profile {
+        profile.record_file_write(write_started_at.elapsed());
+    }
 
     Ok(Vec::new())
 }

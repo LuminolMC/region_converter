@@ -1,13 +1,15 @@
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::formats::{
-    EncodedRegion, LINEAR_SUPERBLOCK, ReadOutcome, RegionStorageFormat, newest_timestamp_seconds,
-    normalize_timestamp_to_seconds, parse_region_coords_from_path, xxhash64,
+    EncodeProfile, EncodedRegion, LINEAR_SUPERBLOCK, ReadOutcome, RegionStorageFormat,
+    newest_timestamp_seconds, normalize_timestamp_to_seconds, parse_region_coords_from_path,
+    xxhash64,
 };
 use crate::io_util::read_file_bytes;
 use crate::model::{ChunkData, REGION_CHUNK_COUNT, Region};
@@ -83,7 +85,16 @@ pub fn encode_region_to_writer(
     compression_level: i32,
     target: &mut dyn RegionWriteTarget,
 ) -> Result<Vec<Diagnostic>> {
-    encode_modern_region_to_writer(region, compression_level, target)
+    encode_modern_region_to_writer(region, compression_level, target, None)
+}
+
+pub fn encode_region_to_writer_profiled(
+    region: &Region,
+    compression_level: i32,
+    target: &mut dyn RegionWriteTarget,
+    profile: Option<&mut EncodeProfile>,
+) -> Result<Vec<Diagnostic>> {
+    encode_modern_region_to_writer(region, compression_level, target, profile)
 }
 
 fn read_region_from_bytes(
@@ -542,10 +553,12 @@ fn encode_modern_region_to_writer(
     region: &Region,
     compression_level: i32,
     target: &mut dyn RegionWriteTarget,
+    mut profile: Option<&mut EncodeProfile>,
 ) -> Result<Vec<Diagnostic>> {
     let mut bucket_metadata = Vec::with_capacity(MODERN_BUCKET_COUNT * MODERN_BUCKET_METADATA_SIZE);
     let main = target.main_file();
 
+    let write_started_at = Instant::now();
     main.write_u64::<BigEndian>(LINEAR_SUPERBLOCK)?;
     main.write_u8(MODERN_VERSION)?;
     main.write_i64::<BigEndian>(newest_timestamp_seconds(region).max(0))?;
@@ -554,12 +567,19 @@ fn encode_modern_region_to_writer(
     main.write_i32::<BigEndian>(region.region_z)?;
     main.write_all(&serialize_existence_bitmap(region))?;
     main.write_u8(0)?;
+    if let Some(profile) = profile.as_deref_mut() {
+        profile.record_file_write(write_started_at.elapsed());
+    }
 
     let metadata_start = main.seek(SeekFrom::Current(0))?;
+    let write_started_at = Instant::now();
     main.write_all(&vec![
         0_u8;
         MODERN_BUCKET_COUNT * MODERN_BUCKET_METADATA_SIZE
     ])?;
+    if let Some(profile) = profile.as_deref_mut() {
+        profile.record_file_write(write_started_at.elapsed());
+    }
 
     for bx in 0..MODERN_GRID_SIZE {
         for bz in 0..MODERN_GRID_SIZE {
@@ -587,8 +607,13 @@ fn encode_modern_region_to_writer(
             }
 
             if has_data {
+                let compress_started_at = Instant::now();
                 let compressed = zstd::bulk::compress(&raw_bucket, compression_level)
                     .context("failed to zstd-compress a linear_v3 bucket")?;
+                if let Some(profile) = profile.as_deref_mut() {
+                    profile.record_compress(compress_started_at.elapsed());
+                    profile.record_unit(raw_bucket.len(), compressed.len());
+                }
                 let compressed_len =
                     i32::try_from(compressed.len()).context("linear_v3 bucket is too large")?;
                 let bucket_hash = xxhash64(MODERN_BUCKET_HASH_SEED, &compressed);
@@ -596,7 +621,11 @@ fn encode_modern_region_to_writer(
                 bucket_metadata.write_i32::<BigEndian>(compressed_len)?;
                 bucket_metadata.write_u8(compression_level as u8)?;
                 bucket_metadata.write_u64::<BigEndian>(bucket_hash)?;
+                let write_started_at = Instant::now();
                 main.write_all(&compressed)?;
+                if let Some(profile) = profile.as_deref_mut() {
+                    profile.record_file_write(write_started_at.elapsed());
+                }
             } else {
                 bucket_metadata.write_i32::<BigEndian>(0)?;
                 bucket_metadata.write_u8(compression_level as u8)?;
@@ -605,11 +634,15 @@ fn encode_modern_region_to_writer(
         }
     }
 
+    let write_started_at = Instant::now();
     main.write_u64::<BigEndian>(LINEAR_SUPERBLOCK)?;
     let end = main.seek(SeekFrom::Current(0))?;
     main.seek(SeekFrom::Start(metadata_start))?;
     main.write_all(&bucket_metadata)?;
     main.seek(SeekFrom::Start(end))?;
+    if let Some(profile) = profile {
+        profile.record_file_write(write_started_at.elapsed());
+    }
 
     Ok(Vec::new())
 }

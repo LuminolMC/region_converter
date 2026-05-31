@@ -285,6 +285,63 @@ fn worker_threads_are_capped_to_discovered_region_files() -> Result<()> {
 }
 
 #[test]
+fn profile_reports_encoded_payload_details_for_each_target_format() -> Result<()> {
+    let targets = [
+        TargetFormatArg::Mca,
+        TargetFormatArg::Linear,
+        TargetFormatArg::BlinearV2,
+        TargetFormatArg::BlinearV3,
+    ];
+
+    for target in targets {
+        let temp_dir = tempdir()?;
+        let input_dir = temp_dir.path().join("input");
+        let output_dir = temp_dir.path().join("output");
+        let mut region = Region::new(0, 0);
+        region.set_chunk(
+            0,
+            ChunkData {
+                timestamp: 123,
+                raw_nbt: pseudo_random_bytes(8 * 1024),
+            },
+        )?;
+        region.set_chunk(
+            17,
+            ChunkData {
+                timestamp: 456,
+                raw_nbt: pseudo_random_bytes(6 * 1024),
+            },
+        )?;
+
+        let encoded = encode_region(&region, RegionFormat::Mca, 6)?;
+        write_encoded_region(&input_dir, "r.0.0.mca", &encoded)?;
+
+        let mut cli = conversion_cli(vec![input_dir], output_dir, SourceFormatArg::Mca, target);
+        cli.profile = true;
+
+        let summary = run(cli)?;
+        let profile = summary.profile.expect("profile should be captured");
+
+        assert_eq!(summary.successful_jobs, 1);
+        assert_eq!(profile.slowest_jobs.len(), 1);
+        assert!(profile.encoded_units > 0);
+        assert!(profile.raw_payload_bytes > 0);
+        assert!(profile.compressed_payload_bytes > 0);
+        assert_eq!(profile.slowest_jobs[0].encoded_units, profile.encoded_units);
+        assert_eq!(
+            profile.slowest_jobs[0].raw_payload_bytes,
+            profile.raw_payload_bytes
+        );
+        assert_eq!(
+            profile.slowest_jobs[0].compressed_payload_bytes,
+            profile.compressed_payload_bytes
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn single_region_file_inputs_write_directly_under_output_root() -> Result<()> {
     let temp_dir = tempdir()?;
     let input_file = temp_dir.path().join("r.-1.-1.mca");

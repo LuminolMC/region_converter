@@ -7,6 +7,7 @@ use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use xxhash_rust::xxh32::xxh32;
@@ -75,6 +76,35 @@ pub struct EncodedRegion {
 pub struct SidecarFile {
     pub file_name: String,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EncodeProfile {
+    pub compress: Duration,
+    pub file_write: Duration,
+    pub encoded_units: usize,
+    pub raw_payload_bytes: u64,
+    pub compressed_payload_bytes: u64,
+}
+
+impl EncodeProfile {
+    pub(crate) fn record_compress(&mut self, duration: Duration) {
+        self.compress += duration;
+    }
+
+    pub(crate) fn record_file_write(&mut self, duration: Duration) {
+        self.file_write += duration;
+    }
+
+    pub(crate) fn record_unit(
+        &mut self,
+        raw_payload_bytes: usize,
+        compressed_payload_bytes: usize,
+    ) {
+        self.encoded_units += 1;
+        self.raw_payload_bytes += raw_payload_bytes as u64;
+        self.compressed_payload_bytes += compressed_payload_bytes as u64;
+    }
 }
 
 impl RegionFormat {
@@ -252,15 +282,53 @@ pub fn encode_region_to_writer(
     compression_level: i32,
     target: &mut dyn RegionWriteTarget,
 ) -> Result<Vec<Diagnostic>> {
+    encode_region_to_writer_profiled(region, format, compression_level, target, None)
+}
+
+pub fn encode_region_to_writer_profiled(
+    region: &Region,
+    format: RegionFormat,
+    compression_level: i32,
+    target: &mut dyn RegionWriteTarget,
+    profile: Option<&mut EncodeProfile>,
+) -> Result<Vec<Diagnostic>> {
     match format {
-        RegionFormat::Mca => mca::encode_region_to_writer(region, compression_level, target),
-        RegionFormat::Linear => linear::encode_region_to_writer(region, compression_level, target),
-        RegionFormat::BlinearV2 => {
-            blinear_v2::encode_region_to_writer(region, compression_level, target)
-        }
-        RegionFormat::BlinearV3 => {
-            blinear_v3::encode_region_to_writer(region, compression_level, target)
-        }
+        RegionFormat::Mca => match profile {
+            Some(profile) => mca::encode_region_to_writer_profiled(
+                region,
+                compression_level,
+                target,
+                Some(profile),
+            ),
+            None => mca::encode_region_to_writer(region, compression_level, target),
+        },
+        RegionFormat::Linear => match profile {
+            Some(profile) => linear::encode_region_to_writer_profiled(
+                region,
+                compression_level,
+                target,
+                Some(profile),
+            ),
+            None => linear::encode_region_to_writer(region, compression_level, target),
+        },
+        RegionFormat::BlinearV2 => match profile {
+            Some(profile) => blinear_v2::encode_region_to_writer_profiled(
+                region,
+                compression_level,
+                target,
+                Some(profile),
+            ),
+            None => blinear_v2::encode_region_to_writer(region, compression_level, target),
+        },
+        RegionFormat::BlinearV3 => match profile {
+            Some(profile) => blinear_v3::encode_region_to_writer_profiled(
+                region,
+                compression_level,
+                target,
+                Some(profile),
+            ),
+            None => blinear_v3::encode_region_to_writer(region, compression_level, target),
+        },
     }
 }
 

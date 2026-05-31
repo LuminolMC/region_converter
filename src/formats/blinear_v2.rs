@@ -1,13 +1,15 @@
 use std::io::{Cursor, Write};
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::formats::{
-    BLINEAR_HASH_SEED, BLINEAR_SUPERBLOCK, EncodedRegion, ReadOutcome, decode_chunk_section,
-    encode_chunk_section, newest_timestamp_millis, parse_region_coords_from_path,
+    BLINEAR_HASH_SEED, BLINEAR_SUPERBLOCK, EncodeProfile, EncodedRegion, ReadOutcome,
+    decode_chunk_section, encode_chunk_section, newest_timestamp_millis,
+    parse_region_coords_from_path,
 };
 use crate::io_util::read_file_bytes;
 use crate::model::{REGION_CHUNK_COUNT, Region};
@@ -155,11 +157,56 @@ pub fn encode_region_to_writer(
     compression_level: i32,
     target: &mut dyn RegionWriteTarget,
 ) -> Result<Vec<Diagnostic>> {
+    encode_region_to_writer_profiled(region, compression_level, target, None)
+}
+
+pub fn encode_region_to_writer_profiled(
+    region: &Region,
+    compression_level: i32,
+    target: &mut dyn RegionWriteTarget,
+    mut profile: Option<&mut EncodeProfile>,
+) -> Result<Vec<Diagnostic>> {
     let main = target.main_file();
+    let write_started_at = Instant::now();
     main.write_i64::<BigEndian>(BLINEAR_SUPERBLOCK)?;
     main.write_u8(0x02)?;
     main.write_i64::<BigEndian>(newest_timestamp_millis(region))?;
     main.write_u8(compression_level as u8)?;
+    if let Some(profile) = profile.as_deref_mut() {
+        profile.record_file_write(write_started_at.elapsed());
+    }
+
+    if profile.is_some() {
+        let mut raw = Vec::new();
+
+        for index in 0..REGION_CHUNK_COUNT {
+            if let Some(chunk) = region.chunk(index) {
+                let section = encode_chunk_section(chunk, BLINEAR_HASH_SEED)?;
+                let section_len =
+                    i32::try_from(section.len()).context("blinear_v2 section is too large")?;
+                raw.write_i32::<BigEndian>(section_len)?;
+                raw.extend_from_slice(&section);
+            } else {
+                raw.write_i32::<BigEndian>(0)?;
+            }
+        }
+
+        let compress_started_at = Instant::now();
+        let compressed = zstd::bulk::compress(&raw, compression_level)
+            .context("failed to zstd-compress the blinear_v2 payload")?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.record_compress(compress_started_at.elapsed());
+            profile.record_unit(raw.len(), compressed.len());
+        }
+
+        let write_started_at = Instant::now();
+        main.write_all(&compressed)?;
+        if let Some(profile) = profile {
+            profile.record_file_write(write_started_at.elapsed());
+        }
+
+        return Ok(Vec::new());
+    }
 
     {
         let mut encoder = zstd::stream::write::Encoder::new(main, compression_level)
