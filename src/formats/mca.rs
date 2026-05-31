@@ -1,5 +1,6 @@
 use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -15,6 +16,7 @@ use crate::formats::{
 };
 use crate::io_util::read_file_bytes;
 use crate::model::{ChunkData, REGION_CHUNK_COUNT, REGION_SIDE, Region};
+use crate::writer::RegionWriteTarget;
 
 const MCA_HEADER_SIZE: usize = 8192;
 const MCA_SECTOR_SIZE: usize = 4096;
@@ -25,9 +27,17 @@ const MCA_EXTERNAL_ZLIB: u8 = MCA_EXTERNAL_FLAG | MCA_COMPRESSION_ZLIB;
 const MAX_INLINE_SECTORS: usize = 255;
 
 pub fn read_region(path: &Path) -> Result<ReadOutcome> {
-    let bytes = read_file_bytes(path)?;
+    let mut file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("failed to read metadata for {}", path.display()))?
+        .len() as usize;
+    let mut header = [0_u8; MCA_HEADER_SIZE];
+    file.read_exact(&mut header)
+        .with_context(|| format!("failed to read mca header from {}", path.display()))?;
     ensure!(
-        bytes.len() >= MCA_HEADER_SIZE,
+        file_len >= MCA_HEADER_SIZE,
         "mca region {} is smaller than the 8 KiB header",
         path.display()
     );
@@ -42,12 +52,12 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
         let timestamp_offset = 4096 + index * 4;
 
         let location = u32::from_be_bytes(
-            bytes[location_offset..location_offset + 4]
+            header[location_offset..location_offset + 4]
                 .try_into()
                 .unwrap(),
         );
         let timestamp = u32::from_be_bytes(
-            bytes[timestamp_offset..timestamp_offset + 4]
+            header[timestamp_offset..timestamp_offset + 4]
                 .try_into()
                 .unwrap(),
         );
@@ -75,7 +85,7 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
 
         let chunk_offset = sector_index * MCA_SECTOR_SIZE;
         let chunk_limit = chunk_offset + sector_count * MCA_SECTOR_SIZE;
-        if chunk_limit > bytes.len() || chunk_offset + 5 > bytes.len() {
+        if chunk_limit > file_len || chunk_offset + 5 > file_len {
             discarded_chunks += 1;
             diagnostics.push(
                 Diagnostic::warning(
@@ -89,18 +99,30 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
             continue;
         }
 
-        let chunk_len =
-            u32::from_be_bytes(bytes[chunk_offset..chunk_offset + 4].try_into().unwrap()) as usize;
-        let compression_type = bytes[chunk_offset + 4];
+        let mut chunk_bytes = vec![0_u8; sector_count * MCA_SECTOR_SIZE];
+        file.seek(SeekFrom::Start(chunk_offset as u64))
+            .with_context(|| {
+                format!("failed to seek to chunk slot {index} in {}", path.display())
+            })?;
+        file.read_exact(&mut chunk_bytes).with_context(|| {
+            format!(
+                "failed to read {} sectors for chunk slot {index} in {}",
+                sector_count,
+                path.display()
+            )
+        })?;
+
+        let chunk_len = u32::from_be_bytes(chunk_bytes[0..4].try_into().unwrap()) as usize;
+        let compression_type = chunk_bytes[4];
 
         let raw_nbt = match decode_chunk_payload(
             path,
             region_x,
             region_z,
             index,
-            &bytes,
-            chunk_offset,
-            chunk_limit,
+            &chunk_bytes,
+            0,
+            chunk_bytes.len(),
             chunk_len,
             compression_type,
         ) {
@@ -312,6 +334,78 @@ pub fn encode_region(region: &Region, compression_level: i32) -> Result<EncodedR
     })
 }
 
+pub fn encode_region_to_writer(
+    region: &Region,
+    compression_level: i32,
+    target: &mut dyn RegionWriteTarget,
+) -> Result<Vec<Diagnostic>> {
+    let mut location_table = [0_u8; 4096];
+    let mut timestamp_table = [0_u8; 4096];
+    let mut next_sector = 2_u32;
+    let compression = Compression::new(compression_level as u32);
+
+    {
+        let main = target.main_file();
+        main.write_all(&[0_u8; MCA_HEADER_SIZE])?;
+    }
+
+    for (index, chunk) in region.iter_chunks() {
+        let compressed = zlib_compress(&chunk.raw_nbt, compression)
+            .with_context(|| format!("failed to compress chunk slot {index}"))?;
+
+        let (timestamp, _) = normalize_timestamp_to_u32(chunk.timestamp);
+        timestamp_table[index * 4..index * 4 + 4].copy_from_slice(&timestamp.to_be_bytes());
+
+        let local_x = index % REGION_SIDE;
+        let local_z = index / REGION_SIDE;
+        let sector_count;
+
+        if compressed.len() + 5 > MAX_INLINE_SECTORS * MCA_SECTOR_SIZE {
+            let mut record = Vec::with_capacity(MCA_SECTOR_SIZE);
+            record.write_u32::<BigEndian>(1)?;
+            record.write_u8(MCA_EXTERNAL_ZLIB)?;
+            pad_to_sector_boundary(&mut record);
+            sector_count = 1_u8;
+
+            target.write_sidecar_file(
+                &external_chunk_file_name(
+                    region.region_x * REGION_SIDE as i32 + local_x as i32,
+                    region.region_z * REGION_SIDE as i32 + local_z as i32,
+                ),
+                &compressed,
+            )?;
+
+            target.main_file().write_all(&record)?;
+        } else {
+            let inline_len =
+                u32::try_from(compressed.len() + 1).context("inline chunk payload is too large")?;
+            let sector_bytes = (compressed.len() + 5).div_ceil(MCA_SECTOR_SIZE) * MCA_SECTOR_SIZE;
+            let mut record = Vec::with_capacity(sector_bytes);
+            record.write_u32::<BigEndian>(inline_len)?;
+            record.write_u8(MCA_COMPRESSION_ZLIB)?;
+            record.extend_from_slice(&compressed);
+            pad_to_sector_boundary(&mut record);
+
+            let sectors = record.len() / MCA_SECTOR_SIZE;
+            sector_count =
+                u8::try_from(sectors).context("inline mca chunk requires too many sectors")?;
+            target.main_file().write_all(&record)?;
+        }
+
+        location_table[index * 4..index * 4 + 4]
+            .copy_from_slice(&encode_location(next_sector, sector_count));
+        next_sector += u32::from(sector_count);
+    }
+
+    let main = target.main_file();
+    main.seek(SeekFrom::Start(0))?;
+    main.write_all(&location_table)?;
+    main.write_all(&timestamp_table)?;
+    main.seek(SeekFrom::End(0))?;
+
+    Ok(Vec::new())
+}
+
 fn decode_chunk_payload(
     region_path: &Path,
     region_x: i32,
@@ -326,6 +420,7 @@ fn decode_chunk_payload(
     let is_external = compression_type & MCA_EXTERNAL_FLAG != 0;
     let compression_id = compression_type & !MCA_EXTERNAL_FLAG;
 
+    let external_storage;
     let compressed = if is_external {
         let chunk_x = region_x * REGION_SIDE as i32 + (chunk_index % REGION_SIDE) as i32;
         let chunk_z = region_z * REGION_SIDE as i32 + (chunk_index / REGION_SIDE) as i32;
@@ -333,7 +428,8 @@ fn decode_chunk_payload(
             .parent()
             .context("mca region file is missing a parent directory")?;
         let external_path = parent.join(external_chunk_file_name(chunk_x, chunk_z));
-        read_file_bytes(&external_path)?
+        external_storage = read_file_bytes(&external_path)?;
+        external_storage.as_slice()
     } else {
         ensure!(chunk_len >= 1, "chunk length is too short");
         let payload_start = chunk_offset + 5;
@@ -342,12 +438,12 @@ fn decode_chunk_payload(
             payload_end <= chunk_limit && payload_end <= region_bytes.len(),
             "chunk payload exceeds its declared sector allocation"
         );
-        region_bytes[payload_start..payload_end].to_vec()
+        &region_bytes[payload_start..payload_end]
     };
 
     match compression_id {
-        MCA_COMPRESSION_GZIP => gzip_decompress(&compressed),
-        MCA_COMPRESSION_ZLIB => zlib_decompress(&compressed),
+        MCA_COMPRESSION_GZIP => gzip_decompress(compressed),
+        MCA_COMPRESSION_ZLIB => zlib_decompress(compressed),
         value => bail!("unsupported mca compression type {value}"),
     }
 }

@@ -24,6 +24,7 @@ pub struct Job {
     pub source_file: PathBuf,
     pub source_format: SourceFormatHint,
     pub destination_file: PathBuf,
+    pub estimated_size_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -110,15 +111,26 @@ pub fn discover_jobs_with_summary(
 
         let destination_file =
             destination_dir.join(target_format.region_file_name(region_x, region_z));
+        let estimated_size_bytes = source
+            .source_file
+            .metadata()
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
         jobs.push(Job {
             source_file: source.source_file,
             source_format: source.source_format,
             destination_file,
+            estimated_size_bytes,
         });
     }
 
     validate_jobs(&jobs)?;
-    jobs.sort_by(|left, right| left.source_file.cmp(&right.source_file));
+    jobs.sort_by(|left, right| {
+        right
+            .estimated_size_bytes
+            .cmp(&left.estimated_size_bytes)
+            .then_with(|| left.source_file.cmp(&right.source_file))
+    });
 
     Ok(DiscoveryResult {
         jobs,

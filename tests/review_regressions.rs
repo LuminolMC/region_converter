@@ -67,6 +67,7 @@ fn conversion_cli(
         to: Some(to),
         threads: Some(1),
         compression_level: None,
+        profile: false,
     }
 }
 
@@ -325,6 +326,7 @@ fn info_mode_reports_single_region_file_details() -> Result<()> {
         to: None,
         threads: Some(1),
         compression_level: None,
+        profile: false,
     })?;
 
     assert_eq!(summary.total_region_files, 1);
@@ -357,6 +359,7 @@ fn info_mode_counts_unreadable_file_sizes_in_totals() -> Result<()> {
         to: None,
         threads: Some(1),
         compression_level: None,
+        profile: false,
     })?;
 
     assert_eq!(summary.total_region_files, 1);

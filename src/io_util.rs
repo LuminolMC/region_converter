@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -28,6 +28,14 @@ pub fn read_file_bytes(path: &Path) -> Result<Vec<u8>> {
 }
 
 pub fn prepare_atomic_write(path: &Path, bytes: &[u8]) -> Result<std::path::PathBuf> {
+    let temp_path = prepare_temp_path(path)?;
+    fs::write(&temp_path, bytes)
+        .with_context(|| format!("failed to write temporary file {}", temp_path.display()))?;
+
+    Ok(temp_path)
+}
+
+pub fn prepare_temp_path(path: &Path) -> Result<PathBuf> {
     let parent = path
         .parent()
         .context("output file does not have a parent directory")?;
@@ -39,12 +47,7 @@ pub fn prepare_atomic_write(path: &Path, bytes: &[u8]) -> Result<std::path::Path
         .map(|name| name.to_string_lossy().into_owned())
         .context("output file is missing a file name")?;
     let temp_name = format!(".{file_name}.tmp-{}-{counter}", process::id());
-    let temp_path = parent.join(temp_name);
-
-    fs::write(&temp_path, bytes)
-        .with_context(|| format!("failed to write temporary file {}", temp_path.display()))?;
-
-    Ok(temp_path)
+    Ok(parent.join(temp_name))
 }
 
 pub fn commit_prepared_file(source: &Path, destination: &Path) -> Result<()> {

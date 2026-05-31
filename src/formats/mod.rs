@@ -15,6 +15,7 @@ use xxhash_rust::xxh64::xxh64;
 use crate::diagnostic::Diagnostic;
 use crate::io_util::read_file_bytes;
 use crate::model::{ChunkData, Region};
+use crate::writer::RegionWriteTarget;
 
 pub const BLINEAR_SUPERBLOCK: i64 = -0x2008_1225_0269;
 pub const LINEAR_SUPERBLOCK: u64 = 0xc3ff_1318_3cca_9d9a;
@@ -242,6 +243,24 @@ pub fn encode_region(
         RegionFormat::Linear => linear::encode_region(region, compression_level),
         RegionFormat::BlinearV2 => blinear_v2::encode_region(region, compression_level),
         RegionFormat::BlinearV3 => blinear_v3::encode_region(region, compression_level),
+    }
+}
+
+pub fn encode_region_to_writer(
+    region: &Region,
+    format: RegionFormat,
+    compression_level: i32,
+    target: &mut dyn RegionWriteTarget,
+) -> Result<Vec<Diagnostic>> {
+    match format {
+        RegionFormat::Mca => mca::encode_region_to_writer(region, compression_level, target),
+        RegionFormat::Linear => linear::encode_region_to_writer(region, compression_level, target),
+        RegionFormat::BlinearV2 => {
+            blinear_v2::encode_region_to_writer(region, compression_level, target)
+        }
+        RegionFormat::BlinearV3 => {
+            blinear_v3::encode_region_to_writer(region, compression_level, target)
+        }
     }
 }
 

@@ -1,4 +1,4 @@
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
@@ -11,6 +11,7 @@ use crate::formats::{
 };
 use crate::io_util::read_file_bytes;
 use crate::model::{REGION_CHUNK_COUNT, Region};
+use crate::writer::RegionWriteTarget;
 
 const HEADER_SIZE: usize = 18;
 
@@ -41,8 +42,7 @@ pub(crate) fn read_region_bytes(path: &Path, bytes: &[u8]) -> Result<ReadOutcome
     let _master_timestamp = cursor.read_i64::<BigEndian>()?;
     let _compression_level = cursor.read_u8()?;
 
-    let mut compressed = Vec::new();
-    cursor.read_to_end(&mut compressed)?;
+    let compressed = &bytes[HEADER_SIZE..];
     let decompressed = zstd::stream::decode_all(Cursor::new(compressed))
         .with_context(|| format!("failed to decompress {}", path.display()))?;
 
@@ -148,4 +148,39 @@ pub fn encode_region(region: &Region, compression_level: i32) -> Result<EncodedR
         sidecar_files: Vec::new(),
         diagnostics: Vec::new(),
     })
+}
+
+pub fn encode_region_to_writer(
+    region: &Region,
+    compression_level: i32,
+    target: &mut dyn RegionWriteTarget,
+) -> Result<Vec<Diagnostic>> {
+    let main = target.main_file();
+    main.write_i64::<BigEndian>(BLINEAR_SUPERBLOCK)?;
+    main.write_u8(0x02)?;
+    main.write_i64::<BigEndian>(newest_timestamp_millis(region))?;
+    main.write_u8(compression_level as u8)?;
+
+    {
+        let mut encoder = zstd::stream::write::Encoder::new(main, compression_level)
+            .context("failed to create the blinear_v2 zstd encoder")?;
+
+        for index in 0..REGION_CHUNK_COUNT {
+            if let Some(chunk) = region.chunk(index) {
+                let section = encode_chunk_section(chunk, BLINEAR_HASH_SEED)?;
+                let section_len =
+                    i32::try_from(section.len()).context("blinear_v2 section is too large")?;
+                encoder.write_i32::<BigEndian>(section_len)?;
+                encoder.write_all(&section)?;
+            } else {
+                encoder.write_i32::<BigEndian>(0)?;
+            }
+        }
+
+        encoder
+            .finish()
+            .context("failed to finish the blinear_v2 zstd stream")?;
+    }
+
+    Ok(Vec::new())
 }

@@ -1,3 +1,4 @@
+use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
@@ -10,6 +11,7 @@ use crate::formats::{
 };
 use crate::io_util::read_file_bytes;
 use crate::model::{REGION_CHUNK_COUNT, Region};
+use crate::writer::RegionWriteTarget;
 
 const HEADER_SIZE: usize = 14;
 const BUCKET_SHIFT: usize = 6;
@@ -286,4 +288,64 @@ pub fn encode_region(region: &Region, compression_level: i32) -> Result<EncodedR
         sidecar_files: Vec::new(),
         diagnostics: Vec::new(),
     })
+}
+
+pub fn encode_region_to_writer(
+    region: &Region,
+    compression_level: i32,
+    target: &mut dyn RegionWriteTarget,
+) -> Result<Vec<Diagnostic>> {
+    let mut offsets = [0_u64; BUCKET_COUNT];
+    let main = target.main_file();
+
+    main.write_i64::<BigEndian>(BLINEAR_SUPERBLOCK)?;
+    main.write_u8(0x03)?;
+    main.write_u8(compression_level as u8)?;
+    main.write_u32::<BigEndian>(BLINEAR_HASH_SEED)?;
+    let offset_table_start = main.seek(SeekFrom::Current(0))?;
+    main.write_all(&[0_u8; POSITION_TABLE_SIZE])?;
+
+    for (bucket_index, offset_entry) in offsets.iter_mut().enumerate() {
+        let first_chunk = bucket_index * BUCKET_SIZE;
+        let mut raw_bucket = Vec::new();
+        let mut has_any_chunk = false;
+
+        for index in first_chunk..first_chunk + BUCKET_SIZE {
+            if let Some(chunk) = region.chunk(index) {
+                let section = encode_chunk_section(chunk, BLINEAR_HASH_SEED)?;
+                let section_len =
+                    i32::try_from(section.len()).context("blinear_v3 section is too large")?;
+                raw_bucket.write_i32::<BigEndian>(section_len)?;
+                raw_bucket.extend_from_slice(&section);
+                has_any_chunk = true;
+            } else {
+                raw_bucket.write_i32::<BigEndian>(0)?;
+            }
+        }
+
+        if !has_any_chunk {
+            continue;
+        }
+
+        let compressed = zstd::bulk::compress(&raw_bucket, compression_level)
+            .context("failed to zstd-compress a blinear_v3 bucket")?;
+        let original_len =
+            i32::try_from(raw_bucket.len()).context("blinear_v3 bucket is too large")?;
+        let compressed_len =
+            i32::try_from(compressed.len()).context("compressed blinear_v3 bucket is too large")?;
+
+        *offset_entry = main.seek(SeekFrom::Current(0))?;
+        main.write_i32::<BigEndian>(original_len)?;
+        main.write_i32::<BigEndian>(compressed_len)?;
+        main.write_all(&compressed)?;
+    }
+
+    let end = main.seek(SeekFrom::Current(0))?;
+    main.seek(SeekFrom::Start(offset_table_start))?;
+    for offset in offsets {
+        main.write_u64::<BigEndian>(offset)?;
+    }
+    main.seek(SeekFrom::Start(end))?;
+
+    Ok(Vec::new())
 }

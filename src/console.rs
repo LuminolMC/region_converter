@@ -6,7 +6,7 @@ use anyhow::Result;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
 
 use region_converter::convert::{
-    JobFailure, JobReport, ProgressSnapshot, RunObserver, RunPlan, RunSummary,
+    JobFailure, JobReport, ProfileSummary, ProgressSnapshot, RunObserver, RunPlan, RunSummary,
 };
 use region_converter::discovery::InputKind;
 use region_converter::formats::SourceFormatHint;
@@ -106,6 +106,9 @@ impl RunObserver for ConsoleReporter {
             );
         }
         println!("  Compression level: {}", plan.compression_level);
+        if plan.profile {
+            println!("  Profiling: enabled");
+        }
         println!("  Region files: {}", plan.total_jobs);
         io::stdout().flush()?;
 
@@ -152,6 +155,9 @@ impl RunObserver for ConsoleReporter {
             summary.total_discarded_chunks,
             summary.total_warnings
         );
+        if let Some(profile) = summary.profile {
+            print_profile_summary(&profile);
+        }
         io::stdout().flush()?;
         Ok(())
     }
@@ -212,13 +218,44 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn print_profile_summary(profile: &ProfileSummary) {
+    println!("Profile:");
+    println!(
+        "  Estimated input: {} | Memory budget: {}",
+        format_bytes(profile.estimated_input_bytes),
+        format_bytes(profile.memory_budget_bytes)
+    );
+    println!(
+        "  Wait: memory {} | read IO {} | write IO {}",
+        format_duration_precise(profile.wait_memory),
+        format_duration_precise(profile.wait_decode_io),
+        format_duration_precise(profile.wait_write_io)
+    );
+    println!(
+        "  Work: decode {} | encode+write {} | total worker time {}",
+        format_duration_precise(profile.decode),
+        format_duration_precise(profile.encode_write),
+        format_duration_precise(profile.total_job_time)
+    );
+}
+
+fn format_duration_precise(duration: Duration) -> String {
+    let seconds = duration.as_secs_f64();
+    if seconds >= 60.0 {
+        format!("{} ({seconds:.2}s)", format_duration(duration))
+    } else {
+        format!("{seconds:.3}s")
+    }
+}
+
 fn render_progress_stats(snapshot: &ProgressSnapshot) -> String {
     format!(
-        "chunks ok {} discarded {} warn {} | {:.1} chunk/s",
+        "chunks ok {} discarded {} warn {} | avg {:.1}/s recent {:.1}/s",
         snapshot.successful_chunks,
         snapshot.discarded_chunks,
         snapshot.warnings,
         snapshot.chunk_rate_per_second(),
+        snapshot.recent_chunk_rate_per_second,
     )
 }
 
@@ -324,7 +361,7 @@ impl IndicatifProgress {
     fn new(total_jobs: usize) -> Self {
         let bar = ProgressBar::with_draw_target(Some(total_jobs as u64), draw_target());
         bar.set_style(progress_style());
-        bar.set_message("chunks ok 0 discarded 0 warn 0 | 0.0 chunk/s".to_string());
+        bar.set_message("chunks ok 0 discarded 0 warn 0 | avg 0.0/s recent 0.0/s".to_string());
         bar.enable_steady_tick(STEADY_TICK_INTERVAL);
         Self { bar }
     }
@@ -357,12 +394,13 @@ mod tests {
             successful_chunks: 485,
             discarded_chunks: 0,
             warnings: 0,
+            recent_chunk_rate_per_second: 1107.3,
             elapsed: Duration::from_millis(438),
         };
 
         assert_eq!(
             render_progress_stats(&snapshot),
-            "chunks ok 485 discarded 0 warn 0 | 1107.3 chunk/s"
+            "chunks ok 485 discarded 0 warn 0 | avg 1107.3/s recent 1107.3/s"
         );
     }
 

@@ -18,6 +18,8 @@ Rust command-line tool for converting Minecraft Java Edition region saves betwee
 
 - Parallel conversion with a configurable worker count
 - Automatic use of available CPU threads when `--threads` is not set, capped to the discovered region-file count to avoid idle workers
+- Size-aware scheduling for large saves, with bounded IO and memory pressure during conversion
+- Streaming output writes that avoid holding full encoded region files in memory before writing
 - Compression level control for compressed target formats
 - Works on Windows and Linux
 - Reads classic `linear` v1/v2 files and modern `linear v3` files
@@ -28,6 +30,7 @@ Rust command-line tool for converting Minecraft Java Edition region saves betwee
 - Supports `--info` mode for detailed save statistics without conversion
 - Prints a concise conversion summary before work starts
 - Shows live progress in a single line with completed regions, successful chunks, discarded chunks, warning counts, and chunk throughput
+- Optional `--profile` mode for conversion-stage timing and resource-limit details
 - Writes each completed region file to the output path immediately instead of waiting for the whole batch to finish
 
 ## Build
@@ -54,6 +57,7 @@ cargo run --release -- \
 --info
 --threads <N>
 --compression-level <LEVEL>
+--profile
 ```
 
 ### Examples
@@ -126,7 +130,13 @@ During conversion, the CLI shows live progress including:
 - completed region files versus total region files
 - successful chunk count and discarded chunk count
 - warnings seen so far
-- chunks per second
+- average and recent-window chunks per second
+
+With `--profile`, the final conversion summary also prints:
+
+- estimated input bytes and memory budget
+- time spent waiting for memory and IO permits
+- accumulated decode and encode/write worker time
 
 With `--info`, the CLI prints:
 
@@ -175,4 +185,3 @@ If it does not, the converter searches recursively and treats the input as a wor
 - `linear` input compatibility covers classic linear v1/v2 and the newer linear v3 layout from the referenced server implementation.
 - `linear` output is written as linear v3.
 - `blinear_v2` and `blinear_v3` are implemented from the referenced server-side format behavior and validated against the sample files.
-

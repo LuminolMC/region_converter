@@ -52,6 +52,12 @@ pub struct Cli {
         help = "Compression level. mca uses zlib 0-9. linear/blinear use zstd 1-22."
     )]
     pub compression_level: Option<i32>,
+
+    #[arg(
+        long,
+        help = "Print conversion stage timing and resource limiter details."
+    )]
+    pub profile: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

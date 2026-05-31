@@ -1,4 +1,4 @@
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -11,6 +11,7 @@ use crate::formats::{
 };
 use crate::io_util::read_file_bytes;
 use crate::model::{ChunkData, REGION_CHUNK_COUNT, Region};
+use crate::writer::RegionWriteTarget;
 
 const CLASSIC_FILE_HEADER_SIZE: usize = 32;
 const CLASSIC_FILE_FOOTER_SIZE: usize = 8;
@@ -75,6 +76,14 @@ pub(crate) fn read_region_storage(
 
 pub fn encode_region(region: &Region, compression_level: i32) -> Result<EncodedRegion> {
     encode_modern_region(region, compression_level)
+}
+
+pub fn encode_region_to_writer(
+    region: &Region,
+    compression_level: i32,
+    target: &mut dyn RegionWriteTarget,
+) -> Result<Vec<Diagnostic>> {
+    encode_modern_region_to_writer(region, compression_level, target)
 }
 
 fn read_region_from_bytes(
@@ -527,6 +536,82 @@ fn encode_modern_region(region: &Region, compression_level: i32) -> Result<Encod
         sidecar_files: Vec::new(),
         diagnostics: Vec::new(),
     })
+}
+
+fn encode_modern_region_to_writer(
+    region: &Region,
+    compression_level: i32,
+    target: &mut dyn RegionWriteTarget,
+) -> Result<Vec<Diagnostic>> {
+    let mut bucket_metadata = Vec::with_capacity(MODERN_BUCKET_COUNT * MODERN_BUCKET_METADATA_SIZE);
+    let main = target.main_file();
+
+    main.write_u64::<BigEndian>(LINEAR_SUPERBLOCK)?;
+    main.write_u8(MODERN_VERSION)?;
+    main.write_i64::<BigEndian>(newest_timestamp_seconds(region).max(0))?;
+    main.write_u8(MODERN_GRID_SIZE as u8)?;
+    main.write_i32::<BigEndian>(region.region_x)?;
+    main.write_i32::<BigEndian>(region.region_z)?;
+    main.write_all(&serialize_existence_bitmap(region))?;
+    main.write_u8(0)?;
+
+    let metadata_start = main.seek(SeekFrom::Current(0))?;
+    main.write_all(&vec![
+        0_u8;
+        MODERN_BUCKET_COUNT * MODERN_BUCKET_METADATA_SIZE
+    ])?;
+
+    for bx in 0..MODERN_GRID_SIZE {
+        for bz in 0..MODERN_GRID_SIZE {
+            let mut raw_bucket = Vec::new();
+            let mut has_data = false;
+
+            for local_x in 0..MODERN_BUCKET_SIDE {
+                for local_z in 0..MODERN_BUCKET_SIDE {
+                    let chunk_index = (bx * MODERN_BUCKET_SIDE + local_x)
+                        + (bz * MODERN_BUCKET_SIDE + local_z) * 32;
+
+                    if let Some(chunk) = region.chunk(chunk_index) {
+                        let chunk_len = i32::try_from(chunk.raw_nbt.len())
+                            .context("linear_v3 chunk payload is too large")?;
+                        let timestamp = normalize_timestamp_to_seconds(chunk.timestamp);
+                        raw_bucket.write_i32::<BigEndian>(chunk_len + 8)?;
+                        raw_bucket.write_i64::<BigEndian>(timestamp)?;
+                        raw_bucket.extend_from_slice(&chunk.raw_nbt);
+                        has_data = true;
+                    } else {
+                        raw_bucket.write_i32::<BigEndian>(0)?;
+                        raw_bucket.write_i64::<BigEndian>(0)?;
+                    }
+                }
+            }
+
+            if has_data {
+                let compressed = zstd::bulk::compress(&raw_bucket, compression_level)
+                    .context("failed to zstd-compress a linear_v3 bucket")?;
+                let compressed_len =
+                    i32::try_from(compressed.len()).context("linear_v3 bucket is too large")?;
+                let bucket_hash = xxhash64(MODERN_BUCKET_HASH_SEED, &compressed);
+
+                bucket_metadata.write_i32::<BigEndian>(compressed_len)?;
+                bucket_metadata.write_u8(compression_level as u8)?;
+                bucket_metadata.write_u64::<BigEndian>(bucket_hash)?;
+                main.write_all(&compressed)?;
+            } else {
+                bucket_metadata.write_i32::<BigEndian>(0)?;
+                bucket_metadata.write_u8(compression_level as u8)?;
+                bucket_metadata.write_u64::<BigEndian>(0)?;
+            }
+        }
+    }
+
+    main.write_u64::<BigEndian>(LINEAR_SUPERBLOCK)?;
+    let end = main.seek(SeekFrom::Current(0))?;
+    main.seek(SeekFrom::Start(metadata_start))?;
+    main.write_all(&bucket_metadata)?;
+    main.seek(SeekFrom::Start(end))?;
+
+    Ok(Vec::new())
 }
 
 fn serialize_existence_bitmap(region: &Region) -> [u8; MODERN_EXISTENCE_BITMAP_SIZE] {
