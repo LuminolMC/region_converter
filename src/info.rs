@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 
 use crate::cli::Cli;
 use crate::diagnostic::{Diagnostic, DiagnosticCode, warning_count};
-use crate::discovery::{InputKind, RegionSource};
+use crate::discovery::{InputKind, RegionFileGroup, RegionSource};
 use crate::formats::{
     RegionStorageFormat, detect_storage_format, read_region_storage, region_storage_size,
 };
@@ -22,6 +22,7 @@ pub struct FormatCount {
 #[derive(Clone, Debug)]
 pub struct RegionInfoEntry {
     pub input_index: usize,
+    pub file_group: RegionFileGroup,
     pub source_file: PathBuf,
     pub storage_format: Option<RegionStorageFormat>,
     pub size_bytes: Option<u64>,
@@ -40,11 +41,20 @@ pub struct InputInfo {
     pub region_files: usize,
     pub readable_regions: usize,
     pub failed_regions: usize,
+    pub group_breakdown: Vec<GroupInfoCount>,
     pub total_size_bytes: u64,
     pub chunk_count: usize,
     pub discarded_chunks: usize,
     pub warnings: usize,
     pub format_breakdown: Vec<FormatCount>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GroupInfoCount {
+    pub file_group: RegionFileGroup,
+    pub region_files: usize,
+    pub readable_regions: usize,
+    pub failed_regions: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +140,7 @@ fn inspect_source(source: &RegionSource) -> RegionInfoEntry {
         Err(error) => {
             return RegionInfoEntry {
                 input_index: source.input_index,
+                file_group: source.file_group,
                 source_file: source.source_file.clone(),
                 storage_format: None,
                 size_bytes: file_size_bytes,
@@ -151,6 +162,7 @@ fn inspect_source(source: &RegionSource) -> RegionInfoEntry {
         Err(error) => {
             return RegionInfoEntry {
                 input_index: source.input_index,
+                file_group: source.file_group,
                 source_file: source.source_file.clone(),
                 storage_format: Some(storage_format),
                 size_bytes: file_size_bytes,
@@ -170,6 +182,7 @@ fn inspect_source(source: &RegionSource) -> RegionInfoEntry {
     match read_region_storage(&source.source_file, storage_format) {
         Ok(read) => RegionInfoEntry {
             input_index: source.input_index,
+            file_group: source.file_group,
             source_file: source.source_file.clone(),
             storage_format: Some(storage_format),
             size_bytes: Some(size_bytes),
@@ -182,6 +195,7 @@ fn inspect_source(source: &RegionSource) -> RegionInfoEntry {
         },
         Err(error) => RegionInfoEntry {
             input_index: source.input_index,
+            file_group: source.file_group,
             source_file: source.source_file.clone(),
             storage_format: Some(storage_format),
             size_bytes: Some(size_bytes),
@@ -209,6 +223,7 @@ struct InputInfoBuilder {
     discarded_chunks: usize,
     warnings: usize,
     formats: HashMap<RegionStorageFormat, usize>,
+    groups: HashMap<RegionFileGroup, GroupInfoCount>,
 }
 
 impl InputInfoBuilder {
@@ -224,6 +239,7 @@ impl InputInfoBuilder {
             discarded_chunks: 0,
             warnings: 0,
             formats: HashMap::new(),
+            groups: HashMap::new(),
         }
     }
 
@@ -246,6 +262,22 @@ impl InputInfoBuilder {
         } else {
             self.readable_regions += 1;
         }
+
+        let group = self
+            .groups
+            .entry(entry.file_group)
+            .or_insert(GroupInfoCount {
+                file_group: entry.file_group,
+                region_files: 0,
+                readable_regions: 0,
+                failed_regions: 0,
+            });
+        group.region_files += 1;
+        if entry.error.is_some() {
+            group.failed_regions += 1;
+        } else {
+            group.readable_regions += 1;
+        }
     }
 
     fn finish(self) -> InputInfo {
@@ -256,6 +288,26 @@ impl InputInfoBuilder {
             .collect::<Vec<_>>();
         format_breakdown
             .sort_by(|left, right| left.format.to_string().cmp(&right.format.to_string()));
+        let mut group_breakdown = RegionFileGroup::ORDERED
+            .iter()
+            .copied()
+            .map(|file_group| {
+                self.groups
+                    .get(&file_group)
+                    .cloned()
+                    .unwrap_or(GroupInfoCount {
+                        file_group,
+                        region_files: 0,
+                        readable_regions: 0,
+                        failed_regions: 0,
+                    })
+            })
+            .collect::<Vec<_>>();
+        group_breakdown.sort_by_key(|entry| match entry.file_group {
+            RegionFileGroup::Regions => 0,
+            RegionFileGroup::Entities => 1,
+            RegionFileGroup::Poi => 2,
+        });
 
         InputInfo {
             input_path: self.input_path,
@@ -263,6 +315,7 @@ impl InputInfoBuilder {
             region_files: self.region_files,
             readable_regions: self.readable_regions,
             failed_regions: self.failed_regions,
+            group_breakdown,
             total_size_bytes: self.total_size_bytes,
             chunk_count: self.chunk_count,
             discarded_chunks: self.discarded_chunks,

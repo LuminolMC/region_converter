@@ -19,8 +19,25 @@ pub enum InputKind {
     WorldDirectory,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum RegionFileGroup {
+    Regions,
+    Entities,
+    Poi,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RegionFileGroupCounts {
+    pub regions: usize,
+    pub entities: usize,
+    pub poi: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct Job {
+    pub input_index: usize,
+    pub input_kind: InputKind,
+    pub file_group: RegionFileGroup,
     pub source_file: PathBuf,
     pub source_format: SourceFormatHint,
     pub destination_file: PathBuf,
@@ -31,6 +48,7 @@ pub struct Job {
 pub struct RegionSource {
     pub input_index: usize,
     pub input_kind: InputKind,
+    pub file_group: RegionFileGroup,
     pub source_file: PathBuf,
     pub source_format: SourceFormatHint,
     pub relative_region_dir: PathBuf,
@@ -60,6 +78,7 @@ pub struct InputDiscovery {
     pub input_kind: InputKind,
     pub discovered_jobs: usize,
     pub region_directories: usize,
+    pub group_counts: RegionFileGroupCounts,
 }
 
 impl Display for InputKind {
@@ -68,6 +87,42 @@ impl Display for InputKind {
             Self::RegionFile => f.write_str("region file"),
             Self::RegionDirectory => f.write_str("region directory"),
             Self::WorldDirectory => f.write_str("world directory"),
+        }
+    }
+}
+
+impl RegionFileGroup {
+    pub const ORDERED: [Self; 3] = [Self::Regions, Self::Entities, Self::Poi];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Regions => "regions",
+            Self::Entities => "entities",
+            Self::Poi => "poi",
+        }
+    }
+}
+
+impl Display for RegionFileGroup {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+impl RegionFileGroupCounts {
+    pub fn add(&mut self, group: RegionFileGroup, count: usize) {
+        match group {
+            RegionFileGroup::Regions => self.regions += count,
+            RegionFileGroup::Entities => self.entities += count,
+            RegionFileGroup::Poi => self.poi += count,
+        }
+    }
+
+    pub fn get(self, group: RegionFileGroup) -> usize {
+        match group {
+            RegionFileGroup::Regions => self.regions,
+            RegionFileGroup::Entities => self.entities,
+            RegionFileGroup::Poi => self.poi,
         }
     }
 }
@@ -117,6 +172,9 @@ pub fn discover_jobs_with_summary(
             .map(|metadata| metadata.len())
             .unwrap_or(0);
         jobs.push(Job {
+            input_index: source.input_index,
+            input_kind: source.input_kind,
+            file_group: source.file_group,
             source_file: source.source_file,
             source_format: source.source_format,
             destination_file,
@@ -159,15 +217,19 @@ pub fn discover_sources_with_summary(
             sources.push(RegionSource {
                 input_index,
                 input_kind: InputKind::RegionFile,
+                file_group: RegionFileGroup::Regions,
                 source_file: input.clone(),
                 source_format: resolve_source_format(input, forced_format)?,
                 relative_region_dir: PathBuf::new(),
             });
+            let mut group_counts = RegionFileGroupCounts::default();
+            group_counts.add(RegionFileGroup::Regions, 1);
             input_summaries.push(InputDiscovery {
                 input_path: input.clone(),
                 input_kind: InputKind::RegionFile,
                 discovered_jobs: 1,
                 region_directories: 0,
+                group_counts,
             });
             continue;
         }
@@ -182,19 +244,24 @@ pub fn discover_sources_with_summary(
         let direct_files = supported_region_files_in_dir(input)?;
         if !direct_files.is_empty() {
             let job_start = sources.len();
+            let file_group = classify_region_file_group(input);
             append_sources(
                 &mut sources,
                 input_index,
                 InputKind::RegionDirectory,
+                file_group,
                 &direct_files,
                 Path::new(""),
                 forced_format,
             )?;
+            let mut group_counts = RegionFileGroupCounts::default();
+            group_counts.add(file_group, sources.len() - job_start);
             input_summaries.push(InputDiscovery {
                 input_path: input.clone(),
                 input_kind: InputKind::RegionDirectory,
                 discovered_jobs: sources.len() - job_start,
                 region_directories: 1,
+                group_counts,
             });
             continue;
         }
@@ -235,15 +302,19 @@ pub fn discover_sources_with_summary(
         }
 
         let job_start = sources.len();
+        let mut group_counts = RegionFileGroupCounts::default();
         for (relative_region_dir, files) in &region_dirs {
+            let file_group = classify_region_file_group(relative_region_dir);
             append_sources(
                 &mut sources,
                 input_index,
                 InputKind::WorldDirectory,
+                file_group,
                 files,
                 relative_region_dir,
                 forced_format,
             )?;
+            group_counts.add(file_group, files.len());
         }
 
         input_summaries.push(InputDiscovery {
@@ -251,6 +322,7 @@ pub fn discover_sources_with_summary(
             input_kind: InputKind::WorldDirectory,
             discovered_jobs: sources.len() - job_start,
             region_directories: region_dirs.len(),
+            group_counts,
         });
     }
 
@@ -276,6 +348,7 @@ fn append_sources(
     sources: &mut Vec<RegionSource>,
     input_index: usize,
     input_kind: InputKind,
+    file_group: RegionFileGroup,
     files: &[PathBuf],
     relative_region_dir: &Path,
     forced_format: Option<SourceFormatHint>,
@@ -284,6 +357,7 @@ fn append_sources(
         sources.push(RegionSource {
             input_index,
             input_kind,
+            file_group,
             source_file: source_file.clone(),
             source_format: resolve_source_format(source_file, forced_format)?,
             relative_region_dir: relative_region_dir.to_path_buf(),
@@ -291,6 +365,14 @@ fn append_sources(
     }
 
     Ok(())
+}
+
+fn classify_region_file_group(path: &Path) -> RegionFileGroup {
+    match path.file_name().and_then(OsStr::to_str) {
+        Some("entities") => RegionFileGroup::Entities,
+        Some("poi") => RegionFileGroup::Poi,
+        _ => RegionFileGroup::Regions,
+    }
 }
 
 fn resolve_source_format(
@@ -435,6 +517,7 @@ mod tests {
             input_kind: InputKind::WorldDirectory,
             discovered_jobs: 1,
             region_directories: 1,
+            group_counts: RegionFileGroupCounts::default(),
         }];
 
         let mounts = build_directory_mounts(&inputs, &summaries);
@@ -451,6 +534,7 @@ mod tests {
                 input_kind: InputKind::WorldDirectory,
                 discovered_jobs: 1,
                 region_directories: 1,
+                group_counts: RegionFileGroupCounts::default(),
             })
             .collect::<Vec<_>>();
 
@@ -469,12 +553,14 @@ mod tests {
             input_kind: InputKind::WorldDirectory,
             discovered_jobs: 1,
             region_directories: 1,
+            group_counts: RegionFileGroupCounts::default(),
         }];
         let summary_b = vec![InputDiscovery {
             input_path: input_b.clone(),
             input_kind: InputKind::WorldDirectory,
             discovered_jobs: 1,
             region_directories: 1,
+            group_counts: RegionFileGroupCounts::default(),
         }];
 
         let mounts_a = build_directory_mounts(&[input_a], &summary_a);

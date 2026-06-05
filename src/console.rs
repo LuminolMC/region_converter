@@ -6,11 +6,12 @@ use anyhow::Result;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
 
 use region_converter::convert::{
-    JobFailure, JobReport, ProfileSummary, ProgressSnapshot, RunObserver, RunPlan, RunSummary,
+    JobFailure, JobReport, ProfileSummary, ProgressSnapshot, RunInputSummary, RunObserver, RunPlan,
+    RunStage, RunSummary,
 };
-use region_converter::discovery::InputKind;
+use region_converter::discovery::{InputKind, RegionFileGroup};
 use region_converter::formats::SourceFormatHint;
-use region_converter::info::{FormatCount, InfoSummary, RegionInfoEntry};
+use region_converter::info::{FormatCount, GroupInfoCount, InfoSummary, RegionInfoEntry};
 
 const BAR_WIDTH: usize = 28;
 const PROGRESS_REFRESH_HZ: u8 = 20;
@@ -18,11 +19,15 @@ const STEADY_TICK_INTERVAL: Duration = Duration::from_millis(80);
 
 pub struct ConsoleReporter {
     progress: Option<IndicatifProgress>,
+    total_inputs: usize,
 }
 
 impl ConsoleReporter {
     pub fn new() -> Self {
-        Self { progress: None }
+        Self {
+            progress: None,
+            total_inputs: 0,
+        }
     }
 
     pub fn print_info_summary(&mut self, summary: &InfoSummary) -> Result<()> {
@@ -31,10 +36,9 @@ impl ConsoleReporter {
         for (input_index, input) in summary.inputs.iter().enumerate() {
             println!("  - {} [{}]", input.input_path.display(), input.input_kind);
             println!("    Region files: {}", input.region_files);
-            println!(
-                "    Readable regions: {} | Failed regions: {}",
-                input.readable_regions, input.failed_regions
-            );
+            if input.input_kind == InputKind::WorldDirectory {
+                print_group_breakdown(&input.group_breakdown);
+            }
             println!(
                 "    Total size: {} ({} bytes)",
                 format_bytes(input.total_size_bytes),
@@ -86,10 +90,11 @@ impl ConsoleReporter {
 
 impl RunObserver for ConsoleReporter {
     fn on_plan(&mut self, plan: &RunPlan) -> Result<()> {
+        self.total_inputs = plan.input_summaries.len();
         println!("Conversion plan:");
         println!("  Inputs ({}):", plan.input_paths.len());
-        for input in &plan.input_paths {
-            println!("  - {}", input.display());
+        for input in &plan.input_summaries {
+            println!("  - {} [{}]", input.input_path.display(), input.input_kind);
         }
         println!("  Output root: {}", plan.output_root.display());
         println!(
@@ -111,8 +116,15 @@ impl RunObserver for ConsoleReporter {
         }
         println!("  Region files: {}", plan.total_jobs);
         io::stdout().flush()?;
+        Ok(())
+    }
 
-        self.progress = Some(IndicatifProgress::new(plan.total_jobs));
+    fn on_stage_start(&mut self, stage: &RunStage) -> Result<()> {
+        if let Some(bar) = self.progress.take() {
+            bar.finish();
+        }
+
+        self.progress = Some(IndicatifProgress::new(stage.total_jobs, stage.file_group));
         Ok(())
     }
 
@@ -137,6 +149,18 @@ impl RunObserver for ConsoleReporter {
             bar.update(progress);
         }
 
+        Ok(())
+    }
+
+    fn on_input_finish(&mut self, summary: &RunInputSummary) -> Result<()> {
+        if let Some(bar) = self.progress.take() {
+            bar.finish();
+        }
+
+        if let Some(line) = format_input_completion_line(summary, self.total_inputs) {
+            println!("{line}");
+            io::stdout().flush()?;
+        }
         Ok(())
     }
 
@@ -199,6 +223,27 @@ fn format_duration(duration: Duration) -> String {
     } else {
         format!("{minutes:02}:{seconds:02}")
     }
+}
+
+fn format_duration_seconds(duration: Duration) -> String {
+    format!("{:.1}s", duration.as_secs_f64())
+}
+
+fn format_input_completion_line(summary: &RunInputSummary, total_inputs: usize) -> Option<String> {
+    if total_inputs <= 1 {
+        return None;
+    }
+
+    Some(format!(
+        "Completed [{}] in {}. Success: {}. Failed: {}. Chunks written: {}. Discarded chunks: {}. Warnings: {}.",
+        summary.input_index + 1,
+        format_duration_seconds(summary.elapsed),
+        summary.successful_jobs,
+        summary.failed_jobs,
+        summary.total_chunks_written,
+        summary.total_discarded_chunks,
+        summary.total_warnings,
+    ))
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -320,6 +365,15 @@ fn format_format_breakdown(formats: &[FormatCount]) -> String {
         .join(", ")
 }
 
+fn print_group_breakdown(groups: &[GroupInfoCount]) {
+    for group in groups {
+        println!(
+            "    {}: {} files | readable {} | failed {}",
+            group.file_group, group.region_files, group.readable_regions, group.failed_regions
+        );
+    }
+}
+
 fn print_single_region_details(entry: &RegionInfoEntry) {
     if let Some(format) = entry.storage_format {
         println!("    Format: {}", format);
@@ -377,9 +431,11 @@ fn draw_target() -> ProgressDrawTarget {
     ProgressDrawTarget::stderr_with_hz(PROGRESS_REFRESH_HZ)
 }
 
-fn progress_style() -> ProgressStyle {
-    let template =
-        format!("[{{bar:{BAR_WIDTH}}}] {{percent_1dp}}% {{pos}}/{{len}} regions | {{msg}}");
+fn progress_style(file_group: RegionFileGroup) -> ProgressStyle {
+    let template = format!(
+        "[{{bar:{BAR_WIDTH}}}] {{percent_1dp}}% {{pos}}/{{len}} {} | {{msg}}",
+        file_group.label()
+    );
 
     ProgressStyle::with_template(&template)
         .expect("progress template should be valid")
@@ -398,9 +454,9 @@ struct IndicatifProgress {
 }
 
 impl IndicatifProgress {
-    fn new(total_jobs: usize) -> Self {
+    fn new(total_jobs: usize, file_group: RegionFileGroup) -> Self {
         let bar = ProgressBar::with_draw_target(Some(total_jobs as u64), draw_target());
-        bar.set_style(progress_style());
+        bar.set_style(progress_style(file_group));
         bar.set_message("chunks ok 0 discarded 0 warn 0 | avg 0.0/s recent 0.0/s".to_string());
         bar.enable_steady_tick(STEADY_TICK_INTERVAL);
         Self { bar }
@@ -422,6 +478,8 @@ impl IndicatifProgress {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     #[test]
@@ -447,5 +505,47 @@ mod tests {
     #[test]
     fn average_chunk_rate_is_derived_from_elapsed_time() {
         assert_eq!(average_chunk_rate(2004, Duration::from_secs(10)), 200.4);
+    }
+
+    #[test]
+    fn multi_input_completion_line_uses_compact_numbered_format() {
+        let summary = RunInputSummary {
+            input_index: 0,
+            input_path: PathBuf::from("/tmp/world"),
+            input_kind: InputKind::WorldDirectory,
+            total_jobs: 3,
+            successful_jobs: 2,
+            failed_jobs: 1,
+            total_chunks_written: 4096,
+            total_discarded_chunks: 7,
+            total_warnings: 5,
+            elapsed: Duration::from_millis(12_340),
+        };
+
+        assert_eq!(
+            format_input_completion_line(&summary, 2),
+            Some(
+                "Completed [1] in 12.3s. Success: 2. Failed: 1. Chunks written: 4096. Discarded chunks: 7. Warnings: 5."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn single_input_completion_line_is_suppressed() {
+        let summary = RunInputSummary {
+            input_index: 0,
+            input_path: PathBuf::from("/tmp/world"),
+            input_kind: InputKind::WorldDirectory,
+            total_jobs: 1,
+            successful_jobs: 1,
+            failed_jobs: 0,
+            total_chunks_written: 1024,
+            total_discarded_chunks: 0,
+            total_warnings: 0,
+            elapsed: Duration::from_millis(250),
+        };
+
+        assert_eq!(format_input_completion_line(&summary, 1), None);
     }
 }

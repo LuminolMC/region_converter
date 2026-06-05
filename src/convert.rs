@@ -6,7 +6,7 @@ use anyhow::{Result, anyhow};
 
 use crate::cli::Cli;
 use crate::diagnostic::{Diagnostic, DiagnosticCode, warning_count};
-use crate::discovery::Job;
+use crate::discovery::{InputDiscovery, InputKind, Job, RegionFileGroup};
 use crate::formats::{
     EncodeProfile, RegionFormat, SourceFormatHint, decode_region, encode_region_to_writer_profiled,
 };
@@ -99,6 +99,29 @@ pub struct ProfiledJobSummary {
     pub total: Duration,
 }
 
+#[derive(Clone, Debug)]
+pub struct RunStage {
+    pub input_index: usize,
+    pub input_path: PathBuf,
+    pub input_kind: InputKind,
+    pub file_group: RegionFileGroup,
+    pub total_jobs: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct RunInputSummary {
+    pub input_index: usize,
+    pub input_path: PathBuf,
+    pub input_kind: InputKind,
+    pub total_jobs: usize,
+    pub successful_jobs: usize,
+    pub failed_jobs: usize,
+    pub total_chunks_written: usize,
+    pub total_discarded_chunks: usize,
+    pub total_warnings: usize,
+    pub elapsed: Duration,
+}
+
 #[derive(Debug)]
 pub enum JobReport {
     Success(JobSuccess),
@@ -134,7 +157,15 @@ pub trait RunObserver {
         Ok(())
     }
 
+    fn on_stage_start(&mut self, _stage: &RunStage) -> Result<()> {
+        Ok(())
+    }
+
     fn on_job_report(&mut self, _report: &JobReport, _progress: &ProgressSnapshot) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_input_finish(&mut self, _summary: &RunInputSummary) -> Result<()> {
         Ok(())
     }
 
@@ -154,6 +185,7 @@ pub fn run_with_observer(cli: Cli, observer: &mut dyn RunObserver) -> Result<Run
 
     let summary = execute_jobs(
         plan.jobs,
+        plan.run_plan.input_summaries.clone(),
         plan.target_format,
         plan.compression_level,
         plan.run_plan.thread_count,
@@ -193,6 +225,7 @@ impl ProgressSnapshot {
 
 fn execute_jobs(
     jobs: Vec<Job>,
+    input_summaries: Vec<InputDiscovery>,
     target_format: RegionFormat,
     compression_level: i32,
     thread_count: usize,
@@ -213,26 +246,85 @@ fn execute_jobs(
         profile_enabled,
     );
 
-    stream_parallel(
-        jobs,
-        thread_count,
-        move |job| {
-            process_job(
-                job,
-                target_format,
-                compression_level,
-                resources.clone(),
-                profile_enabled,
-            )
-        },
-        |report| {
-            accumulator.apply(&report, started_at.elapsed());
-            observer.on_job_report(&report, &accumulator.snapshot)?;
-            Ok(())
-        },
-    )?;
+    let mut jobs_by_input = Vec::new();
+    jobs_by_input.resize_with(input_summaries.len(), Vec::new);
+    for job in jobs {
+        let input_index = job.input_index;
+        if let Some(input_jobs) = jobs_by_input.get_mut(input_index) {
+            input_jobs.push(job);
+        }
+    }
+
+    for (input_index, input) in input_summaries.iter().enumerate() {
+        let input_started_at = Instant::now();
+        let mut input_accumulator = InputRunAccumulator::new(input);
+        let mut jobs_by_group = Vec::new();
+        jobs_by_group.resize_with(RegionFileGroup::ORDERED.len(), Vec::new);
+        for job in jobs_by_input
+            .get_mut(input_index)
+            .map(std::mem::take)
+            .unwrap_or_default()
+        {
+            jobs_by_group[group_index(job.file_group)].push(job);
+        }
+
+        for file_group in RegionFileGroup::ORDERED {
+            let stage_jobs = std::mem::take(&mut jobs_by_group[group_index(file_group)]);
+            if stage_jobs.is_empty() {
+                continue;
+            }
+
+            observer.on_stage_start(&RunStage {
+                input_index,
+                input_path: input.input_path.clone(),
+                input_kind: input.input_kind,
+                file_group,
+                total_jobs: stage_jobs.len(),
+            })?;
+
+            let stage_started_at = Instant::now();
+            let mut stage_accumulator = StageProgressAccumulator::new(stage_jobs.len());
+            let resources_for_stage = resources.clone();
+
+            stream_parallel(
+                stage_jobs,
+                thread_count,
+                move |job| {
+                    process_job(
+                        job,
+                        target_format,
+                        compression_level,
+                        resources_for_stage.clone(),
+                        profile_enabled,
+                    )
+                },
+                |report| {
+                    let total_elapsed = started_at.elapsed();
+                    accumulator.apply(&report, total_elapsed);
+                    input_accumulator.apply(&report);
+                    stage_accumulator.apply(&report, stage_started_at.elapsed());
+                    observer.on_job_report(&report, &stage_accumulator.snapshot)?;
+                    Ok(())
+                },
+            )?;
+        }
+
+        observer.on_input_finish(&input_accumulator.finish(
+            input_index,
+            input,
+            input_started_at.elapsed(),
+        ))?;
+    }
 
     Ok(accumulator.finish(started_at.elapsed()))
+}
+
+fn group_index(group: RegionFileGroup) -> usize {
+    match group {
+        RegionFileGroup::Regions => 0,
+        RegionFileGroup::Entities => 1,
+        RegionFileGroup::Poi => 2,
+    }
 }
 
 fn process_job(
@@ -414,6 +506,26 @@ struct SummaryAccumulator {
     snapshot: ProgressSnapshot,
 }
 
+struct StageProgressAccumulator {
+    total_jobs: usize,
+    successful_jobs: usize,
+    failed_jobs: usize,
+    total_chunks_written: usize,
+    total_discarded_chunks: usize,
+    total_warnings: usize,
+    recent_samples: VecDeque<(Duration, usize)>,
+    snapshot: ProgressSnapshot,
+}
+
+struct InputRunAccumulator {
+    total_jobs: usize,
+    successful_jobs: usize,
+    failed_jobs: usize,
+    total_chunks_written: usize,
+    total_discarded_chunks: usize,
+    total_warnings: usize,
+}
+
 impl SummaryAccumulator {
     fn new(
         total_jobs: usize,
@@ -531,33 +643,7 @@ impl SummaryAccumulator {
     }
 
     fn recent_chunk_rate(&mut self, elapsed: Duration) -> f64 {
-        const WINDOW: Duration = Duration::from_secs(30);
-        if self.recent_samples.len() < 2 {
-            return ratio_per_second(self.total_chunks_written, elapsed);
-        }
-
-        while let Some((sample_time, _)) = self.recent_samples.front() {
-            if elapsed.saturating_sub(*sample_time) <= WINDOW {
-                break;
-            }
-            self.recent_samples.pop_front();
-        }
-
-        if self.recent_samples.len() < 2 {
-            return ratio_per_second(self.total_chunks_written, elapsed);
-        }
-
-        let Some((oldest_time, _)) = self.recent_samples.front() else {
-            return 0.0;
-        };
-        let window = elapsed.saturating_sub(*oldest_time);
-        let chunks = self
-            .recent_samples
-            .iter()
-            .map(|(_, chunks)| *chunks)
-            .sum::<usize>();
-        let seconds = window.as_secs_f64().max(0.001);
-        chunks as f64 / seconds
+        recent_chunk_rate(&mut self.recent_samples, self.total_chunks_written, elapsed)
     }
 
     fn finish(self, elapsed: Duration) -> RunSummary {
@@ -575,6 +661,159 @@ impl SummaryAccumulator {
             profile: self.profile,
             elapsed,
         }
+    }
+}
+
+fn recent_chunk_rate(
+    recent_samples: &mut VecDeque<(Duration, usize)>,
+    total_chunks_written: usize,
+    elapsed: Duration,
+) -> f64 {
+    const WINDOW: Duration = Duration::from_secs(30);
+    if recent_samples.len() < 2 {
+        return ratio_per_second(total_chunks_written, elapsed);
+    }
+
+    while let Some((sample_time, _)) = recent_samples.front() {
+        if elapsed.saturating_sub(*sample_time) <= WINDOW {
+            break;
+        }
+        recent_samples.pop_front();
+    }
+
+    if recent_samples.len() < 2 {
+        return ratio_per_second(total_chunks_written, elapsed);
+    }
+
+    let Some((oldest_time, _)) = recent_samples.front() else {
+        return 0.0;
+    };
+    let window = elapsed.saturating_sub(*oldest_time);
+    let chunks = recent_samples
+        .iter()
+        .map(|(_, chunks)| *chunks)
+        .sum::<usize>();
+    let seconds = window.as_secs_f64().max(0.001);
+    chunks as f64 / seconds
+}
+
+impl StageProgressAccumulator {
+    fn new(total_jobs: usize) -> Self {
+        Self {
+            total_jobs,
+            successful_jobs: 0,
+            failed_jobs: 0,
+            total_chunks_written: 0,
+            total_discarded_chunks: 0,
+            total_warnings: 0,
+            recent_samples: VecDeque::new(),
+            snapshot: ProgressSnapshot {
+                total_jobs,
+                completed_jobs: 0,
+                successful_jobs: 0,
+                failed_jobs: 0,
+                successful_chunks: 0,
+                discarded_chunks: 0,
+                warnings: 0,
+                recent_chunk_rate_per_second: 0.0,
+                elapsed: Duration::ZERO,
+            },
+        }
+    }
+
+    fn apply(&mut self, report: &JobReport, elapsed: Duration) {
+        let stats = report_stats(report);
+        self.successful_jobs += stats.successful_jobs;
+        self.failed_jobs += stats.failed_jobs;
+        self.total_chunks_written += stats.chunks_written;
+        self.total_discarded_chunks += stats.discarded_chunks;
+        self.total_warnings += stats.warnings;
+
+        self.recent_samples
+            .push_back((elapsed, stats.chunks_written));
+        let recent_chunk_rate_per_second =
+            recent_chunk_rate(&mut self.recent_samples, self.total_chunks_written, elapsed);
+
+        self.snapshot = ProgressSnapshot {
+            total_jobs: self.total_jobs,
+            completed_jobs: self.successful_jobs + self.failed_jobs,
+            successful_jobs: self.successful_jobs,
+            failed_jobs: self.failed_jobs,
+            successful_chunks: self.total_chunks_written,
+            discarded_chunks: self.total_discarded_chunks,
+            warnings: self.total_warnings,
+            recent_chunk_rate_per_second,
+            elapsed,
+        };
+    }
+}
+
+impl InputRunAccumulator {
+    fn new(input: &InputDiscovery) -> Self {
+        Self {
+            total_jobs: input.discovered_jobs,
+            successful_jobs: 0,
+            failed_jobs: 0,
+            total_chunks_written: 0,
+            total_discarded_chunks: 0,
+            total_warnings: 0,
+        }
+    }
+
+    fn apply(&mut self, report: &JobReport) {
+        let stats = report_stats(report);
+        self.successful_jobs += stats.successful_jobs;
+        self.failed_jobs += stats.failed_jobs;
+        self.total_chunks_written += stats.chunks_written;
+        self.total_discarded_chunks += stats.discarded_chunks;
+        self.total_warnings += stats.warnings;
+    }
+
+    fn finish(
+        self,
+        input_index: usize,
+        input: &InputDiscovery,
+        elapsed: Duration,
+    ) -> RunInputSummary {
+        RunInputSummary {
+            input_index,
+            input_path: input.input_path.clone(),
+            input_kind: input.input_kind,
+            total_jobs: self.total_jobs,
+            successful_jobs: self.successful_jobs,
+            failed_jobs: self.failed_jobs,
+            total_chunks_written: self.total_chunks_written,
+            total_discarded_chunks: self.total_discarded_chunks,
+            total_warnings: self.total_warnings,
+            elapsed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ReportStats {
+    successful_jobs: usize,
+    failed_jobs: usize,
+    chunks_written: usize,
+    discarded_chunks: usize,
+    warnings: usize,
+}
+
+fn report_stats(report: &JobReport) -> ReportStats {
+    match report {
+        JobReport::Success(report) => ReportStats {
+            successful_jobs: 1,
+            chunks_written: report.chunk_count,
+            discarded_chunks: report.discarded_chunks,
+            warnings: warning_count(&report.diagnostics),
+            ..ReportStats::default()
+        },
+        JobReport::Failure(report) => ReportStats {
+            failed_jobs: 1,
+            discarded_chunks: report.discarded_chunks,
+            warnings: warning_count(&report.diagnostics),
+            ..ReportStats::default()
+        },
     }
 }
 

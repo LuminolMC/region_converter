@@ -6,8 +6,10 @@ use anyhow::Result;
 use tempfile::tempdir;
 
 use region_converter::cli::{Cli, SourceFormatArg, TargetFormatArg};
-use region_converter::convert::run;
-use region_converter::discovery::discover_jobs;
+use region_converter::convert::{
+    JobReport, ProgressSnapshot, RunObserver, RunStage, run, run_with_observer,
+};
+use region_converter::discovery::{RegionFileGroup, discover_jobs, discover_jobs_with_summary};
 use region_converter::formats::{RegionFormat, SourceFormatHint, encode_region};
 use region_converter::info::inspect;
 use region_converter::model::{ChunkData, Region};
@@ -51,6 +53,27 @@ fn pseudo_random_bytes(len: usize) -> Vec<u8> {
     }
 
     bytes
+}
+
+fn write_sample_mca_file(destination: &Path) -> Result<()> {
+    let mut region = Region::new(0, 0);
+    region.set_chunk(
+        0,
+        ChunkData {
+            timestamp: 1,
+            raw_nbt: pseudo_random_bytes(256),
+        },
+    )?;
+    let encoded = encode_region(&region, RegionFormat::Mca, 6)?;
+    let parent = destination
+        .parent()
+        .expect("test destination should always have a parent");
+    let file_name = destination
+        .file_name()
+        .expect("test destination should always have a file name")
+        .to_string_lossy()
+        .to_string();
+    write_encoded_region(parent, &file_name, &encoded)
 }
 
 fn conversion_cli(
@@ -366,6 +389,131 @@ fn single_region_file_inputs_write_directly_under_output_root() -> Result<()> {
 }
 
 #[test]
+fn discovery_classifies_world_region_entities_and_poi_groups() -> Result<()> {
+    let temp_dir = tempdir()?;
+    let world_dir = temp_dir.path().join("world");
+    let output_root = temp_dir.path().join("output");
+
+    write_sample_mca_file(&world_dir.join("region/r.-1.-1.mca"))?;
+    write_sample_mca_file(&world_dir.join("entities/r.0.0.mca"))?;
+    write_sample_mca_file(&world_dir.join("poi/r.1.1.mca"))?;
+
+    let discovery = discover_jobs_with_summary(
+        std::slice::from_ref(&world_dir),
+        &output_root,
+        Some(SourceFormatHint::Mca),
+        RegionFormat::Linear,
+    )?;
+
+    assert_eq!(discovery.jobs.len(), 3);
+    assert_eq!(discovery.summary.inputs[0].group_counts.regions, 1);
+    assert_eq!(discovery.summary.inputs[0].group_counts.entities, 1);
+    assert_eq!(discovery.summary.inputs[0].group_counts.poi, 1);
+    assert!(
+        discovery
+            .jobs
+            .iter()
+            .any(|job| job.file_group == RegionFileGroup::Regions)
+    );
+    assert!(
+        discovery
+            .jobs
+            .iter()
+            .any(|job| job.file_group == RegionFileGroup::Entities)
+    );
+    assert!(
+        discovery
+            .jobs
+            .iter()
+            .any(|job| job.file_group == RegionFileGroup::Poi)
+    );
+    Ok(())
+}
+
+#[test]
+fn direct_entities_directory_input_is_classified_as_entities() -> Result<()> {
+    let temp_dir = tempdir()?;
+    let input_dir = temp_dir.path().join("entities");
+    let output_root = temp_dir.path().join("output");
+
+    write_sample_mca_file(&input_dir.join("r.-1.-1.mca"))?;
+
+    let discovery = discover_jobs_with_summary(
+        std::slice::from_ref(&input_dir),
+        &output_root,
+        Some(SourceFormatHint::Mca),
+        RegionFormat::Linear,
+    )?;
+
+    assert_eq!(discovery.jobs.len(), 1);
+    assert_eq!(discovery.jobs[0].file_group, RegionFileGroup::Entities);
+    assert_eq!(discovery.summary.inputs[0].group_counts.entities, 1);
+    Ok(())
+}
+
+#[test]
+fn conversion_runs_inputs_and_world_groups_in_sequence() -> Result<()> {
+    let temp_dir = tempdir()?;
+    let input_a = temp_dir.path().join("a_world");
+    let input_b = temp_dir.path().join("b_world");
+    let output_root = temp_dir.path().join("output");
+
+    write_sample_mca_file(&input_a.join("region/r.-1.-1.mca"))?;
+    write_sample_mca_file(&input_a.join("entities/r.0.0.mca"))?;
+    write_sample_mca_file(&input_b.join("poi/r.1.1.mca"))?;
+
+    let mut observer = RecordingObserver::default();
+    let summary = run_with_observer(
+        conversion_cli(
+            vec![input_a, input_b],
+            output_root,
+            SourceFormatArg::Mca,
+            TargetFormatArg::Linear,
+        ),
+        &mut observer,
+    )?;
+
+    assert_eq!(summary.successful_jobs, 3);
+    assert_eq!(
+        observer.events,
+        vec![
+            "stage 0 regions",
+            "stage 0 entities",
+            "completed 0",
+            "stage 1 poi",
+            "completed 1",
+        ]
+    );
+    Ok(())
+}
+
+#[derive(Default)]
+struct RecordingObserver {
+    events: Vec<String>,
+}
+
+impl RunObserver for RecordingObserver {
+    fn on_stage_start(&mut self, stage: &RunStage) -> Result<()> {
+        self.events
+            .push(format!("stage {} {}", stage.input_index, stage.file_group));
+        Ok(())
+    }
+
+    fn on_job_report(&mut self, _report: &JobReport, _progress: &ProgressSnapshot) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_input_finish(
+        &mut self,
+        summary: &region_converter::convert::RunInputSummary,
+    ) -> Result<()> {
+        self.events
+            .push(format!("completed {}", summary.input_index));
+        Ok(())
+    }
+}
+
+#[test]
 fn info_mode_reports_single_region_file_details() -> Result<()> {
     let temp_dir = tempdir()?;
     let input_file = temp_dir.path().join("r.-1.-1.mca");
@@ -399,6 +547,35 @@ fn info_mode_reports_single_region_file_details() -> Result<()> {
             .map(|format| format.to_string()),
         Some("mca".to_string())
     );
+    Ok(())
+}
+
+#[test]
+fn info_mode_reports_world_group_readable_counts() -> Result<()> {
+    let temp_dir = tempdir()?;
+    let world_dir = temp_dir.path().join("world");
+
+    write_sample_mca_file(&world_dir.join("region/r.-1.-1.mca"))?;
+    write_sample_mca_file(&world_dir.join("entities/r.0.0.mca"))?;
+    write_sample_mca_file(&world_dir.join("poi/r.1.1.mca"))?;
+
+    let summary = inspect(Cli {
+        inputs: vec![world_dir],
+        output: None,
+        info: true,
+        from: SourceFormatArg::Auto,
+        to: None,
+        threads: Some(1),
+        compression_level: None,
+        profile: false,
+    })?;
+
+    assert_eq!(summary.inputs[0].group_breakdown.len(), 3);
+    for group in &summary.inputs[0].group_breakdown {
+        assert_eq!(group.region_files, 1);
+        assert_eq!(group.readable_regions, 1);
+        assert_eq!(group.failed_regions, 0);
+    }
     Ok(())
 }
 
