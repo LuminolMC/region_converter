@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -11,7 +12,7 @@ use crate::formats::{
     EncodeProfile, RegionFormat, SourceFormatHint, decode_region, encode_region_to_writer_profiled,
 };
 use crate::pipeline::stream_parallel;
-use crate::planner::plan_conversion;
+use crate::planner::{ConversionPlan, plan_conversion};
 use crate::runtime::RuntimeResources;
 use crate::writer::{WriteTransactionProfile, write_region_with_transaction_profiled};
 
@@ -183,16 +184,7 @@ pub fn run_with_observer(cli: Cli, observer: &mut dyn RunObserver) -> Result<Run
     let plan = plan_conversion(&cli)?;
     observer.on_plan(&plan.run_plan)?;
 
-    let summary = execute_jobs(
-        plan.jobs,
-        plan.run_plan.input_summaries.clone(),
-        plan.target_format,
-        plan.compression_level,
-        plan.run_plan.thread_count,
-        plan.run_plan.total_region_directories,
-        plan.run_plan.profile,
-        observer,
-    )?;
+    let summary = execute_jobs(plan, observer)?;
     observer.on_finish(&summary)?;
     Ok(summary)
 }
@@ -223,16 +215,14 @@ impl ProgressSnapshot {
     }
 }
 
-fn execute_jobs(
-    jobs: Vec<Job>,
-    input_summaries: Vec<InputDiscovery>,
-    target_format: RegionFormat,
-    compression_level: i32,
-    thread_count: usize,
-    total_region_directories: usize,
-    profile_enabled: bool,
-    observer: &mut dyn RunObserver,
-) -> Result<RunSummary> {
+fn execute_jobs(plan: ConversionPlan, observer: &mut dyn RunObserver) -> Result<RunSummary> {
+    let jobs = plan.jobs;
+    let input_summaries = plan.run_plan.input_summaries;
+    let target_format = plan.target_format;
+    let compression_level = plan.compression_level;
+    let thread_count = plan.run_plan.thread_count;
+    let total_region_directories = plan.run_plan.total_region_directories;
+    let profile_enabled = plan.run_plan.profile;
     let total_jobs = jobs.len();
     let started_at = Instant::now();
     let resources = RuntimeResources::for_thread_count(thread_count);
@@ -638,7 +628,7 @@ impl SummaryAccumulator {
         });
         summary
             .slowest_jobs
-            .sort_by(|left, right| right.encode_write.cmp(&left.encode_write));
+            .sort_by_key(|job| Reverse(job.encode_write));
         summary.slowest_jobs.truncate(5);
     }
 

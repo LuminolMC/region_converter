@@ -65,19 +65,6 @@ pub struct DecodedRegion {
     pub outcome: ReadOutcome,
 }
 
-#[derive(Debug)]
-pub struct EncodedRegion {
-    pub main_file_bytes: Vec<u8>,
-    pub sidecar_files: Vec<SidecarFile>,
-    pub diagnostics: Vec<Diagnostic>,
-}
-
-#[derive(Debug)]
-pub struct SidecarFile {
-    pub file_name: String,
-    pub bytes: Vec<u8>,
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EncodeProfile {
     pub compress: Duration,
@@ -263,19 +250,6 @@ pub fn read_region_storage(path: &Path, format: RegionStorageFormat) -> Result<R
     }
 }
 
-pub fn encode_region(
-    region: &Region,
-    format: RegionFormat,
-    compression_level: i32,
-) -> Result<EncodedRegion> {
-    match format {
-        RegionFormat::Mca => mca::encode_region(region, compression_level),
-        RegionFormat::Linear => linear::encode_region(region, compression_level),
-        RegionFormat::BlinearV2 => blinear_v2::encode_region(region, compression_level),
-        RegionFormat::BlinearV3 => blinear_v3::encode_region(region, compression_level),
-    }
-}
-
 pub fn encode_region_to_writer(
     region: &Region,
     format: RegionFormat,
@@ -353,7 +327,7 @@ pub fn parse_region_coords_from_path(path: &Path) -> Result<(i32, i32)> {
 
     let parts: Vec<&str> = file_name.split('.').collect();
     ensure!(
-        parts.len() >= 4 && parts.first() == Some(&"r"),
+        parts.len() == 4 && parts.first() == Some(&"r"),
         "region file name does not match r.<x>.<z>.<ext>: {}",
         file_name
     );
@@ -523,5 +497,18 @@ pub(crate) fn detect_blinear_format_from_bytes(
             "unsupported blinear version {version} in {}",
             path.display()
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    #[test]
+    fn region_file_names_must_have_exactly_four_segments() {
+        assert!(parse_region_coords_from_path(Path::new("r.0.0.mca")).is_ok());
+        assert!(parse_region_coords_from_path(Path::new("r.0.0.extra.mca")).is_err());
     }
 }

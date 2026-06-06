@@ -7,8 +7,8 @@ use byteorder::{BigEndian, WriteBytesExt};
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::formats::{
-    BLINEAR_HASH_SEED, BLINEAR_SUPERBLOCK, EncodeProfile, EncodedRegion, ReadOutcome,
-    decode_chunk_section, encode_chunk_section, parse_region_coords_from_path,
+    BLINEAR_HASH_SEED, BLINEAR_SUPERBLOCK, EncodeProfile, ReadOutcome, decode_chunk_section,
+    encode_chunk_section, parse_region_coords_from_path,
 };
 use crate::io_util::read_file_bytes;
 use crate::model::{REGION_CHUNK_COUNT, Region};
@@ -62,8 +62,31 @@ pub(crate) fn read_region_bytes(path: &Path, bytes: &[u8]) -> Result<ReadOutcome
             continue;
         }
 
-        let bucket_offset = bucket_offset as usize;
-        if bucket_offset < DATA_START_OFFSET || bucket_offset + 8 > bytes.len() {
+        let Ok(bucket_offset) = usize::try_from(bucket_offset) else {
+            diagnostics.push(
+                Diagnostic::warning(
+                    DiagnosticCode::SkippedData,
+                    format!(
+                        "bucket {bucket_index} offset does not fit this platform and was skipped"
+                    ),
+                )
+                .with_path(path)
+                .with_region_coords(region_x, region_z),
+            );
+            continue;
+        };
+        let Some(bucket_header_end) = bucket_offset.checked_add(8) else {
+            diagnostics.push(
+                Diagnostic::warning(
+                    DiagnosticCode::SkippedData,
+                    format!("bucket {bucket_index} offset overflows the file address space and was skipped"),
+                )
+                .with_path(path)
+                .with_region_coords(region_x, region_z),
+            );
+            continue;
+        };
+        if bucket_offset < DATA_START_OFFSET || bucket_header_end > bytes.len() {
             diagnostics.push(
                 Diagnostic::warning(
                     DiagnosticCode::SkippedData,
@@ -97,8 +120,18 @@ pub(crate) fn read_region_bytes(path: &Path, bytes: &[u8]) -> Result<ReadOutcome
 
         let original_len = original_len as usize;
         let compressed_len = compressed_len as usize;
-        let compressed_start = bucket_offset + 8;
-        let compressed_end = compressed_start + compressed_len;
+        let compressed_start = bucket_header_end;
+        let Some(compressed_end) = compressed_start.checked_add(compressed_len) else {
+            diagnostics.push(
+                Diagnostic::warning(
+                    DiagnosticCode::SkippedData,
+                    format!("bucket {bucket_index} compressed length overflows the file address space and was skipped"),
+                )
+                .with_path(path)
+                .with_region_coords(region_x, region_z),
+            );
+            continue;
+        };
 
         if compressed_end > bytes.len() {
             diagnostics.push(
@@ -234,63 +267,6 @@ pub(crate) fn read_region_bytes(path: &Path, bytes: &[u8]) -> Result<ReadOutcome
     })
 }
 
-pub fn encode_region(region: &Region, compression_level: i32) -> Result<EncodedRegion> {
-    let mut offsets = [0_u64; BUCKET_COUNT];
-    let mut bucket_data = Vec::new();
-
-    for (bucket_index, offset_entry) in offsets.iter_mut().enumerate() {
-        let first_chunk = bucket_index * BUCKET_SIZE;
-        let mut raw_bucket = Vec::new();
-        let mut has_any_chunk = false;
-
-        for index in first_chunk..first_chunk + BUCKET_SIZE {
-            if let Some(chunk) = region.chunk(index) {
-                let section = encode_chunk_section(chunk, BLINEAR_HASH_SEED)?;
-                let section_len =
-                    i32::try_from(section.len()).context("blinear_v3 section is too large")?;
-                raw_bucket.write_i32::<BigEndian>(section_len)?;
-                raw_bucket.extend_from_slice(&section);
-                has_any_chunk = true;
-            } else {
-                raw_bucket.write_i32::<BigEndian>(0)?;
-            }
-        }
-
-        if !has_any_chunk {
-            continue;
-        }
-
-        let compressed = zstd::bulk::compress(&raw_bucket, compression_level)
-            .context("failed to zstd-compress a blinear_v3 bucket")?;
-        let original_len =
-            i32::try_from(raw_bucket.len()).context("blinear_v3 bucket is too large")?;
-        let compressed_len =
-            i32::try_from(compressed.len()).context("compressed blinear_v3 bucket is too large")?;
-
-        *offset_entry = (DATA_START_OFFSET + bucket_data.len()) as u64;
-        bucket_data.write_i32::<BigEndian>(original_len)?;
-        bucket_data.write_i32::<BigEndian>(compressed_len)?;
-        bucket_data.extend_from_slice(&compressed);
-    }
-
-    let mut main_file_bytes = Vec::with_capacity(DATA_START_OFFSET + bucket_data.len());
-    main_file_bytes.write_i64::<BigEndian>(BLINEAR_SUPERBLOCK)?;
-    main_file_bytes.write_u8(0x03)?;
-    main_file_bytes.write_u8(compression_level as u8)?;
-    main_file_bytes.write_u32::<BigEndian>(BLINEAR_HASH_SEED)?;
-
-    for offset in offsets {
-        main_file_bytes.write_u64::<BigEndian>(offset)?;
-    }
-    main_file_bytes.extend_from_slice(&bucket_data);
-
-    Ok(EncodedRegion {
-        main_file_bytes,
-        sidecar_files: Vec::new(),
-        diagnostics: Vec::new(),
-    })
-}
-
 pub fn encode_region_to_writer(
     region: &Region,
     compression_level: i32,
@@ -313,7 +289,7 @@ pub fn encode_region_to_writer_profiled(
     main.write_u8(0x03)?;
     main.write_u8(compression_level as u8)?;
     main.write_u32::<BigEndian>(BLINEAR_HASH_SEED)?;
-    let offset_table_start = main.seek(SeekFrom::Current(0))?;
+    let offset_table_start = main.stream_position()?;
     main.write_all(&[0_u8; POSITION_TABLE_SIZE])?;
     if let Some(profile) = profile.as_deref_mut() {
         profile.record_file_write(write_started_at.elapsed());
@@ -354,7 +330,7 @@ pub fn encode_region_to_writer_profiled(
             i32::try_from(compressed.len()).context("compressed blinear_v3 bucket is too large")?;
 
         let write_started_at = Instant::now();
-        *offset_entry = main.seek(SeekFrom::Current(0))?;
+        *offset_entry = main.stream_position()?;
         main.write_i32::<BigEndian>(original_len)?;
         main.write_i32::<BigEndian>(compressed_len)?;
         main.write_all(&compressed)?;
@@ -364,7 +340,7 @@ pub fn encode_region_to_writer_profiled(
     }
 
     let write_started_at = Instant::now();
-    let end = main.seek(SeekFrom::Current(0))?;
+    let end = main.stream_position()?;
     main.seek(SeekFrom::Start(offset_table_start))?;
     for offset in offsets {
         main.write_u64::<BigEndian>(offset)?;
@@ -375,4 +351,30 @@ pub fn encode_region_to_writer_profiled(
     }
 
     Ok(Vec::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    #[test]
+    fn oversized_bucket_offsets_are_reported_without_panicking() -> Result<()> {
+        let mut bytes = Vec::new();
+        bytes.write_i64::<BigEndian>(BLINEAR_SUPERBLOCK)?;
+        bytes.write_u8(0x03)?;
+        bytes.write_u8(6)?;
+        bytes.write_u32::<BigEndian>(BLINEAR_HASH_SEED)?;
+        bytes.write_u64::<BigEndian>(u64::MAX)?;
+        for _ in 1..BUCKET_COUNT {
+            bytes.write_u64::<BigEndian>(0)?;
+        }
+
+        let outcome = read_region_bytes(Path::new("r.0.0.b_linear"), &bytes)?;
+
+        assert_eq!(outcome.region.chunk_count(), 0);
+        assert_eq!(outcome.diagnostics.len(), 1);
+        Ok(())
+    }
 }

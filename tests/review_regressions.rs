@@ -10,35 +10,16 @@ use region_converter::convert::{
     JobReport, ProgressSnapshot, RunObserver, RunStage, run, run_with_observer,
 };
 use region_converter::discovery::{RegionFileGroup, discover_jobs, discover_jobs_with_summary};
-use region_converter::formats::{RegionFormat, SourceFormatHint, encode_region};
+use region_converter::formats::{RegionFormat, SourceFormatHint, encode_region_to_writer};
 use region_converter::info::inspect;
 use region_converter::model::{ChunkData, Region};
+use region_converter::writer::write_region_with_transaction;
 
-fn reference_path(relative: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
-}
-
-fn copy_reference_file(relative: &str, destination: &Path) -> Result<()> {
-    fs::create_dir_all(
-        destination
-            .parent()
-            .expect("test destination should always have a parent"),
-    )?;
-    fs::copy(reference_path(relative), destination)?;
-    Ok(())
-}
-
-fn write_encoded_region(
-    destination_dir: &Path,
-    file_name: &str,
-    encoded: &region_converter::formats::EncodedRegion,
-) -> Result<()> {
-    fs::create_dir_all(destination_dir)?;
-    fs::write(destination_dir.join(file_name), &encoded.main_file_bytes)?;
-    for sidecar in &encoded.sidecar_files {
-        fs::write(destination_dir.join(&sidecar.file_name), &sidecar.bytes)?;
-    }
-    Ok(())
+fn write_region_file(destination: &Path, format: RegionFormat, region: &Region) -> Result<()> {
+    write_region_with_transaction(format, destination, |target| {
+        encode_region_to_writer(region, format, 6, target)?;
+        Ok(())
+    })
 }
 
 fn pseudo_random_bytes(len: usize) -> Vec<u8> {
@@ -64,16 +45,7 @@ fn write_sample_mca_file(destination: &Path) -> Result<()> {
             raw_nbt: pseudo_random_bytes(256),
         },
     )?;
-    let encoded = encode_region(&region, RegionFormat::Mca, 6)?;
-    let parent = destination
-        .parent()
-        .expect("test destination should always have a parent");
-    let file_name = destination
-        .file_name()
-        .expect("test destination should always have a file name")
-        .to_string_lossy()
-        .to_string();
-    write_encoded_region(parent, &file_name, &encoded)
+    write_region_file(destination, RegionFormat::Mca, &region)
 }
 
 fn conversion_cli(
@@ -100,10 +72,7 @@ fn auto_detection_defers_corrupt_blinear_failures_to_job_execution() -> Result<(
     let input_dir = temp_dir.path().join("input");
     let output_dir = temp_dir.path().join("output");
 
-    copy_reference_file(
-        "reference/minecraft_world_trimmer_mca/test_files/r.-1.-1.mca",
-        &input_dir.join("r.-1.-1.mca"),
-    )?;
+    write_sample_mca_file(&input_dir.join("r.-1.-1.mca"))?;
     fs::create_dir_all(&input_dir)?;
     fs::write(input_dir.join("r.0.0.b_linear"), [0_u8, 1, 2, 3])?;
 
@@ -126,14 +95,8 @@ fn discovery_skips_preexisting_output_trees() -> Result<()> {
     let world_dir = temp_dir.path().join("world");
     let output_root = world_dir.join("out");
 
-    copy_reference_file(
-        "reference/minecraft_world_trimmer_mca/test_files/r.-1.-1.mca",
-        &world_dir.join("region/r.-1.-1.mca"),
-    )?;
-    copy_reference_file(
-        "reference/minecraft_world_trimmer_mca/test_files/r.-1.-1.mca",
-        &output_root.join("DIM1/region/r.9.9.mca"),
-    )?;
+    write_sample_mca_file(&world_dir.join("region/r.-1.-1.mca"))?;
+    write_sample_mca_file(&output_root.join("DIM1/region/r.9.9.mca"))?;
 
     let jobs = discover_jobs(&[world_dir], &output_root, None, RegionFormat::Linear)?;
 
@@ -156,14 +119,8 @@ fn multi_input_mounts_do_not_collide_when_trailing_paths_match() -> Result<()> {
     let input_b = temp_dir.path().join("two/a/archive/world");
     let output_root = temp_dir.path().join("output");
 
-    copy_reference_file(
-        "reference/minecraft_world_trimmer_mca/test_files/r.-1.-1.mca",
-        &input_a.join("region/r.-1.-1.mca"),
-    )?;
-    copy_reference_file(
-        "reference/minecraft_world_trimmer_mca/test_files/r.-1.-1.mca",
-        &input_b.join("region/r.-1.-1.mca"),
-    )?;
+    write_sample_mca_file(&input_a.join("region/r.-1.-1.mca"))?;
+    write_sample_mca_file(&input_b.join("region/r.-1.-1.mca"))?;
 
     let jobs = discover_jobs(
         &[input_a.clone(), input_b.clone()],
@@ -188,14 +145,8 @@ fn directory_mounts_remain_unique_across_separate_runs() -> Result<()> {
     let input_b = temp_dir.path().join("b/world");
     let output_root = temp_dir.path().join("output");
 
-    copy_reference_file(
-        "reference/minecraft_world_trimmer_mca/test_files/r.-1.-1.mca",
-        &input_a.join("region/r.-1.-1.mca"),
-    )?;
-    copy_reference_file(
-        "reference/minecraft_world_trimmer_mca/test_files/r.-1.-1.mca",
-        &input_b.join("region/r.-1.-1.mca"),
-    )?;
+    write_sample_mca_file(&input_a.join("region/r.-1.-1.mca"))?;
+    write_sample_mca_file(&input_b.join("region/r.-1.-1.mca"))?;
 
     let jobs_a = discover_jobs(
         std::slice::from_ref(&input_a),
@@ -230,10 +181,9 @@ fn mca_overwrite_is_rejected_when_existing_destination_uses_external_sidecars() 
             raw_nbt: pseudo_random_bytes(1_400_000),
         },
     )?;
-    let encoded = encode_region(&region, RegionFormat::Mca, 6)?;
-    assert!(!encoded.sidecar_files.is_empty());
 
-    write_encoded_region(&input_dir, "r.0.0.mca", &encoded)?;
+    write_region_file(&input_dir.join("r.0.0.mca"), RegionFormat::Mca, &region)?;
+    assert!(input_dir.join("c.0.0.mcc").exists());
     let mapped_output_dir = discover_jobs(
         std::slice::from_ref(&input_dir),
         &output_dir,
@@ -244,19 +194,17 @@ fn mca_overwrite_is_rejected_when_existing_destination_uses_external_sidecars() 
         .parent()
         .expect("discovered destination should have a parent")
         .to_path_buf();
-    write_encoded_region(&mapped_output_dir, "r.0.0.mca", &encoded)?;
+    write_region_file(
+        &mapped_output_dir.join("r.0.0.mca"),
+        RegionFormat::Mca,
+        &region,
+    )?;
 
     let original_main = fs::read(mapped_output_dir.join("r.0.0.mca"))?;
-    let original_sidecars = encoded
-        .sidecar_files
-        .iter()
-        .map(|sidecar| {
-            Ok::<_, anyhow::Error>((
-                sidecar.file_name.clone(),
-                fs::read(mapped_output_dir.join(&sidecar.file_name))?,
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let original_sidecars = vec![(
+        "c.0.0.mcc".to_string(),
+        fs::read(mapped_output_dir.join("c.0.0.mcc"))?,
+    )];
 
     let mut cli = conversion_cli(
         vec![input_dir],
@@ -287,10 +235,7 @@ fn worker_threads_are_capped_to_discovered_region_files() -> Result<()> {
     let input_dir = temp_dir.path().join("input");
     let output_dir = temp_dir.path().join("output");
 
-    copy_reference_file(
-        "reference/minecraft_world_trimmer_mca/test_files/r.-1.-1.mca",
-        &input_dir.join("r.-1.-1.mca"),
-    )?;
+    write_sample_mca_file(&input_dir.join("r.-1.-1.mca"))?;
 
     let mut cli = conversion_cli(
         vec![input_dir],
@@ -336,8 +281,7 @@ fn profile_reports_encoded_payload_details_for_each_target_format() -> Result<()
             },
         )?;
 
-        let encoded = encode_region(&region, RegionFormat::Mca, 6)?;
-        write_encoded_region(&input_dir, "r.0.0.mca", &encoded)?;
+        write_region_file(&input_dir.join("r.0.0.mca"), RegionFormat::Mca, &region)?;
 
         let mut cli = conversion_cli(vec![input_dir], output_dir, SourceFormatArg::Mca, target);
         cli.profile = true;
@@ -370,13 +314,10 @@ fn single_region_file_inputs_write_directly_under_output_root() -> Result<()> {
     let input_file = temp_dir.path().join("r.-1.-1.mca");
     let output_root = temp_dir.path().join("output");
 
-    copy_reference_file(
-        "reference/minecraft_world_trimmer_mca/test_files/r.-1.-1.mca",
-        &input_file,
-    )?;
+    write_sample_mca_file(&input_file)?;
 
     let jobs = discover_jobs(
-        &[input_file.clone()],
+        std::slice::from_ref(&input_file),
         &output_root,
         Some(SourceFormatHint::Mca),
         RegionFormat::Linear,
@@ -518,10 +459,7 @@ fn info_mode_reports_single_region_file_details() -> Result<()> {
     let temp_dir = tempdir()?;
     let input_file = temp_dir.path().join("r.-1.-1.mca");
 
-    copy_reference_file(
-        "reference/minecraft_world_trimmer_mca/test_files/r.-1.-1.mca",
-        &input_file,
-    )?;
+    write_sample_mca_file(&input_file)?;
 
     let summary = inspect(Cli {
         inputs: vec![input_file.clone()],

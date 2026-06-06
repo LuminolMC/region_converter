@@ -68,10 +68,10 @@ where
 
     let mut consumer_error = None;
     for result in receiver {
-        if consumer_error.is_none() {
-            if let Err(error) = consumer(result) {
-                consumer_error = Some(error);
-            }
+        if consumer_error.is_none()
+            && let Err(error) = consumer(result)
+        {
+            consumer_error = Some(error);
         }
     }
 

@@ -286,8 +286,7 @@ impl InputInfoBuilder {
             .into_iter()
             .map(|(format, count)| FormatCount { format, count })
             .collect::<Vec<_>>();
-        format_breakdown
-            .sort_by(|left, right| left.format.to_string().cmp(&right.format.to_string()));
+        format_breakdown.sort_by_key(|entry| entry.format.to_string());
         let mut group_breakdown = RegionFileGroup::ORDERED
             .iter()
             .copied()

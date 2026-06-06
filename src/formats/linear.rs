@@ -7,9 +7,8 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::formats::{
-    EncodeProfile, EncodedRegion, LINEAR_SUPERBLOCK, ReadOutcome, RegionStorageFormat,
-    newest_timestamp_seconds, normalize_timestamp_to_seconds, parse_region_coords_from_path,
-    xxhash64,
+    EncodeProfile, LINEAR_SUPERBLOCK, ReadOutcome, RegionStorageFormat, newest_timestamp_seconds,
+    normalize_timestamp_to_seconds, parse_region_coords_from_path, xxhash64,
 };
 use crate::io_util::read_file_bytes;
 use crate::model::{ChunkData, REGION_CHUNK_COUNT, Region};
@@ -74,10 +73,6 @@ pub(crate) fn read_region_storage(
 ) -> Result<ReadOutcome> {
     let bytes = read_file_bytes(path)?;
     read_region_from_bytes(path, &bytes, storage_format)
-}
-
-pub fn encode_region(region: &Region, compression_level: i32) -> Result<EncodedRegion> {
-    encode_modern_region(region, compression_level)
 }
 
 pub fn encode_region_to_writer(
@@ -481,74 +476,6 @@ fn read_modern_region(
     })
 }
 
-fn encode_modern_region(region: &Region, compression_level: i32) -> Result<EncodedRegion> {
-    let mut bucket_metadata = Vec::with_capacity(MODERN_BUCKET_COUNT * MODERN_BUCKET_METADATA_SIZE);
-    let mut bucket_bytes = Vec::new();
-
-    for bx in 0..MODERN_GRID_SIZE {
-        for bz in 0..MODERN_GRID_SIZE {
-            let mut raw_bucket = Vec::new();
-            let mut has_data = false;
-
-            for local_x in 0..MODERN_BUCKET_SIDE {
-                for local_z in 0..MODERN_BUCKET_SIDE {
-                    let chunk_index = (bx * MODERN_BUCKET_SIDE + local_x)
-                        + (bz * MODERN_BUCKET_SIDE + local_z) * 32;
-
-                    if let Some(chunk) = region.chunk(chunk_index) {
-                        let chunk_len = i32::try_from(chunk.raw_nbt.len())
-                            .context("linear_v3 chunk payload is too large")?;
-                        let timestamp = normalize_timestamp_to_seconds(chunk.timestamp);
-                        raw_bucket.write_i32::<BigEndian>(chunk_len + 8)?;
-                        raw_bucket.write_i64::<BigEndian>(timestamp)?;
-                        raw_bucket.extend_from_slice(&chunk.raw_nbt);
-                        has_data = true;
-                    } else {
-                        raw_bucket.write_i32::<BigEndian>(0)?;
-                        raw_bucket.write_i64::<BigEndian>(0)?;
-                    }
-                }
-            }
-
-            if has_data {
-                let compressed = zstd::bulk::compress(&raw_bucket, compression_level)
-                    .context("failed to zstd-compress a linear_v3 bucket")?;
-                let compressed_len =
-                    i32::try_from(compressed.len()).context("linear_v3 bucket is too large")?;
-                let bucket_hash = xxhash64(MODERN_BUCKET_HASH_SEED, &compressed);
-
-                bucket_metadata.write_i32::<BigEndian>(compressed_len)?;
-                bucket_metadata.write_u8(compression_level as u8)?;
-                bucket_metadata.write_u64::<BigEndian>(bucket_hash)?;
-                bucket_bytes.extend_from_slice(&compressed);
-            } else {
-                bucket_metadata.write_i32::<BigEndian>(0)?;
-                bucket_metadata.write_u8(compression_level as u8)?;
-                bucket_metadata.write_u64::<BigEndian>(0)?;
-            }
-        }
-    }
-
-    let mut main_file_bytes = Vec::new();
-    main_file_bytes.write_u64::<BigEndian>(LINEAR_SUPERBLOCK)?;
-    main_file_bytes.write_u8(MODERN_VERSION)?;
-    main_file_bytes.write_i64::<BigEndian>(newest_timestamp_seconds(region).max(0))?;
-    main_file_bytes.write_u8(MODERN_GRID_SIZE as u8)?;
-    main_file_bytes.write_i32::<BigEndian>(region.region_x)?;
-    main_file_bytes.write_i32::<BigEndian>(region.region_z)?;
-    main_file_bytes.extend_from_slice(&serialize_existence_bitmap(region));
-    main_file_bytes.write_u8(0)?;
-    main_file_bytes.extend_from_slice(&bucket_metadata);
-    main_file_bytes.extend_from_slice(&bucket_bytes);
-    main_file_bytes.write_u64::<BigEndian>(LINEAR_SUPERBLOCK)?;
-
-    Ok(EncodedRegion {
-        main_file_bytes,
-        sidecar_files: Vec::new(),
-        diagnostics: Vec::new(),
-    })
-}
-
 fn encode_modern_region_to_writer(
     region: &Region,
     compression_level: i32,
@@ -571,7 +498,7 @@ fn encode_modern_region_to_writer(
         profile.record_file_write(write_started_at.elapsed());
     }
 
-    let metadata_start = main.seek(SeekFrom::Current(0))?;
+    let metadata_start = main.stream_position()?;
     let write_started_at = Instant::now();
     main.write_all(&vec![
         0_u8;
@@ -636,7 +563,7 @@ fn encode_modern_region_to_writer(
 
     let write_started_at = Instant::now();
     main.write_u64::<BigEndian>(LINEAR_SUPERBLOCK)?;
-    let end = main.seek(SeekFrom::Current(0))?;
+    let end = main.stream_position()?;
     main.seek(SeekFrom::Start(metadata_start))?;
     main.write_all(&bucket_metadata)?;
     main.seek(SeekFrom::Start(end))?;
@@ -670,6 +597,8 @@ fn bitmap_contains(bitmap: &[u8; MODERN_EXISTENCE_BITMAP_SIZE], index: usize) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::RegionFormat;
+    use crate::writer::write_region_with_transaction;
 
     #[test]
     fn detects_linear_versions() -> Result<()> {
@@ -703,10 +632,12 @@ mod tests {
             },
         )?;
 
-        let encoded = encode_region(&region, 6)?;
         let temp_dir = tempfile::tempdir()?;
         let output_file = temp_dir.path().join("r.3.-4.linear");
-        std::fs::write(&output_file, &encoded.main_file_bytes)?;
+        write_region_with_transaction(RegionFormat::Linear, &output_file, |target| {
+            encode_region_to_writer(&region, 6, target)?;
+            Ok(())
+        })?;
 
         let reparsed = read_region(&output_file)?;
         assert_eq!(reparsed.region, region);

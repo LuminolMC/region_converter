@@ -31,7 +31,6 @@ Rust command-line tool for converting Minecraft Java Edition region saves betwee
 - Prints a concise conversion summary before work starts
 - Shows live progress in a single line with completed regions, successful chunks, discarded chunks, warning counts, and chunk throughput
 - Optional `--profile` mode for conversion-stage timing and resource-limit details
-- Writes each completed region file to the output path immediately instead of waiting for the whole batch to finish
 
 ## Build
 

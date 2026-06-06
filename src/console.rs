@@ -53,14 +53,13 @@ impl ConsoleReporter {
                 format_format_breakdown(&input.format_breakdown)
             );
 
-            if input.input_kind == InputKind::RegionFile {
-                if let Some(entry) = summary
+            if input.input_kind == InputKind::RegionFile
+                && let Some(entry) = summary
                     .entries
                     .iter()
                     .find(|entry| entry.input_index == input_index)
-                {
-                    print_single_region_details(entry);
-                }
+            {
+                print_single_region_details(entry);
             }
         }
 
@@ -468,7 +467,7 @@ impl IndicatifProgress {
     }
 
     fn println(&self, line: &str) {
-        let _ = self.bar.println(line);
+        self.bar.println(line);
     }
 
     fn finish(&self) {

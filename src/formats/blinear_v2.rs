@@ -7,9 +7,8 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::formats::{
-    BLINEAR_HASH_SEED, BLINEAR_SUPERBLOCK, EncodeProfile, EncodedRegion, ReadOutcome,
-    decode_chunk_section, encode_chunk_section, newest_timestamp_millis,
-    parse_region_coords_from_path,
+    BLINEAR_HASH_SEED, BLINEAR_SUPERBLOCK, EncodeProfile, ReadOutcome, decode_chunk_section,
+    encode_chunk_section, newest_timestamp_millis, parse_region_coords_from_path,
 };
 use crate::io_util::read_file_bytes;
 use crate::model::{REGION_CHUNK_COUNT, Region};
@@ -117,38 +116,6 @@ pub(crate) fn read_region_bytes(path: &Path, bytes: &[u8]) -> Result<ReadOutcome
         region,
         diagnostics,
         discarded_chunks,
-    })
-}
-
-pub fn encode_region(region: &Region, compression_level: i32) -> Result<EncodedRegion> {
-    let mut raw = Vec::new();
-
-    for index in 0..REGION_CHUNK_COUNT {
-        if let Some(chunk) = region.chunk(index) {
-            let section = encode_chunk_section(chunk, BLINEAR_HASH_SEED)?;
-            let section_len =
-                i32::try_from(section.len()).context("blinear_v2 section is too large")?;
-            raw.write_i32::<BigEndian>(section_len)?;
-            raw.extend_from_slice(&section);
-        } else {
-            raw.write_i32::<BigEndian>(0)?;
-        }
-    }
-
-    let compressed = zstd::bulk::compress(&raw, compression_level)
-        .context("failed to zstd-compress the blinear_v2 payload")?;
-
-    let mut main_file_bytes = Vec::with_capacity(HEADER_SIZE + compressed.len());
-    main_file_bytes.write_i64::<BigEndian>(BLINEAR_SUPERBLOCK)?;
-    main_file_bytes.write_u8(0x02)?;
-    main_file_bytes.write_i64::<BigEndian>(newest_timestamp_millis(region))?;
-    main_file_bytes.write_u8(compression_level as u8)?;
-    main_file_bytes.extend_from_slice(&compressed);
-
-    Ok(EncodedRegion {
-        main_file_bytes,
-        sidecar_files: Vec::new(),
-        diagnostics: Vec::new(),
     })
 }
 

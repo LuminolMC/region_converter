@@ -12,8 +12,7 @@ use flate2::write::ZlibEncoder;
 
 use crate::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::formats::{
-    EncodeProfile, EncodedRegion, ReadOutcome, SidecarFile, normalize_timestamp_to_u32,
-    parse_region_coords_from_path,
+    EncodeProfile, ReadOutcome, normalize_timestamp_to_u32, parse_region_coords_from_path,
 };
 use crate::io_util::read_file_bytes;
 use crate::model::{ChunkData, REGION_CHUNK_COUNT, REGION_SIDE, Region};
@@ -122,8 +121,6 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
             region_z,
             index,
             &chunk_bytes,
-            0,
-            chunk_bytes.len(),
             chunk_len,
             compression_type,
         ) {
@@ -265,76 +262,6 @@ pub fn storage_size(path: &Path) -> Result<u64> {
     Ok(total_size)
 }
 
-pub fn encode_region(region: &Region, compression_level: i32) -> Result<EncodedRegion> {
-    let mut location_table = vec![0_u8; 4096];
-    let mut timestamp_table = vec![0_u8; 4096];
-    let mut sector_data = Vec::new();
-    let mut sidecar_files = Vec::new();
-    let mut next_sector = 2_u32;
-
-    let compression = Compression::new(compression_level as u32);
-
-    for (index, chunk) in region.iter_chunks() {
-        let compressed = zlib_compress(&chunk.raw_nbt, compression)
-            .with_context(|| format!("failed to compress chunk slot {index}"))?;
-
-        let (timestamp, _) = normalize_timestamp_to_u32(chunk.timestamp);
-        timestamp_table[index * 4..index * 4 + 4].copy_from_slice(&timestamp.to_be_bytes());
-
-        let local_x = index % REGION_SIDE;
-        let local_z = index / REGION_SIDE;
-
-        let mut record = Vec::new();
-        let sector_count;
-        let compression_type;
-
-        if compressed.len() + 5 > MAX_INLINE_SECTORS * MCA_SECTOR_SIZE {
-            compression_type = MCA_EXTERNAL_ZLIB;
-            record.write_u32::<BigEndian>(1)?;
-            record.write_u8(compression_type)?;
-            pad_to_sector_boundary(&mut record);
-            sector_count = 1_u8;
-
-            sidecar_files.push(SidecarFile {
-                file_name: external_chunk_file_name(
-                    region.region_x * REGION_SIDE as i32 + local_x as i32,
-                    region.region_z * REGION_SIDE as i32 + local_z as i32,
-                ),
-                bytes: compressed,
-            });
-        } else {
-            compression_type = MCA_COMPRESSION_ZLIB;
-            let inline_len =
-                u32::try_from(compressed.len() + 1).context("inline chunk payload is too large")?;
-            record.write_u32::<BigEndian>(inline_len)?;
-            record.write_u8(compression_type)?;
-            record.extend_from_slice(&compressed);
-            pad_to_sector_boundary(&mut record);
-
-            let sectors = record.len() / MCA_SECTOR_SIZE;
-            let sectors =
-                u8::try_from(sectors).context("inline mca chunk requires too many sectors")?;
-            sector_count = sectors;
-        }
-
-        location_table[index * 4..index * 4 + 4]
-            .copy_from_slice(&encode_location(next_sector, sector_count));
-        next_sector += u32::from(sector_count);
-        sector_data.extend_from_slice(&record);
-    }
-
-    let mut main_file_bytes = Vec::with_capacity(MCA_HEADER_SIZE + sector_data.len());
-    main_file_bytes.extend_from_slice(&location_table);
-    main_file_bytes.extend_from_slice(&timestamp_table);
-    main_file_bytes.extend_from_slice(&sector_data);
-
-    Ok(EncodedRegion {
-        main_file_bytes,
-        sidecar_files,
-        diagnostics: Vec::new(),
-    })
-}
-
 pub fn encode_region_to_writer(
     region: &Region,
     compression_level: i32,
@@ -447,8 +374,6 @@ fn decode_chunk_payload(
     region_z: i32,
     chunk_index: usize,
     region_bytes: &[u8],
-    chunk_offset: usize,
-    chunk_limit: usize,
     chunk_len: usize,
     compression_type: u8,
 ) -> Result<Vec<u8>> {
@@ -467,10 +392,10 @@ fn decode_chunk_payload(
         external_storage.as_slice()
     } else {
         ensure!(chunk_len >= 1, "chunk length is too short");
-        let payload_start = chunk_offset + 5;
-        let payload_end = chunk_offset + 4 + chunk_len;
+        let payload_start = 5;
+        let payload_end = 4 + chunk_len;
         ensure!(
-            payload_end <= chunk_limit && payload_end <= region_bytes.len(),
+            payload_end <= region_bytes.len(),
             "chunk payload exceeds its declared sector allocation"
         );
         &region_bytes[payload_start..payload_end]
