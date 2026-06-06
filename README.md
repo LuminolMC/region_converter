@@ -32,6 +32,16 @@ Rust command-line tool for converting Minecraft Java Edition region saves betwee
 - Shows live progress in a single line with completed regions, successful chunks, discarded chunks, warning counts, and chunk throughput
 - Optional `--profile` mode for conversion-stage timing and resource-limit details
 
+## Prebuilt binaries
+
+Release artifacts are built for compatibility first. Choose the prebuilt binary that matches your OS and CPU:
+
+- `*-compat` artifacts are the safest choice. Use them when you want the widest compatibility, are unsure about CPU support, or are running on older systems. It will result in a significant loss of performance.
+- `linux-x86_64-v3-gnu` requires a Linux x86_64 system with a glibc runtime and an x86-64-v3 capable CPU.
+- `windows-x86_64-v3` requires a Windows x86_64 system with an x86-64-v3 capable CPU.
+
+For the best performance, build the tool locally on the machine where it will run instead of using a prebuilt binary. Local builds can use your exact CPU, linker, C runtime, and dependency build settings, which is especially useful for compression-heavy conversions.
+
 ## Build
 
 ```bash

@@ -21,41 +21,59 @@ jobs:
         include:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-musl
-            artifact_name: region_converter-linux-x86_64
+            artifact_name: region_converter-linux-x86_64-compat
             binary_name: region_converter
             build_tool: cargo zigbuild
             rustflags: ""
 
           - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact_name: region_converter-linux-x86_64-v3-gnu
+            binary_name: region_converter
+            build_tool: cargo build
+            rustflags: "-C target-cpu=x86-64-v3"
+
+          - os: ubuntu-22.04
             target: aarch64-unknown-linux-musl
-            artifact_name: region_converter-linux-arm64
+            artifact_name: region_converter-linux-arm64-compat
             binary_name: region_converter
             build_tool: cargo zigbuild
             rustflags: ""
 
           - os: windows-2022
             target: x86_64-pc-windows-msvc
-            artifact_name: region_converter-windows-x86_64
+            artifact_name: region_converter-windows-x86_64-compat
             binary_name: region_converter.exe
             build_tool: cargo build
             rustflags: "-C target-feature=+crt-static"
 
           - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            artifact_name: region_converter-windows-x86_64-v3
+            binary_name: region_converter.exe
+            build_tool: cargo build
+            rustflags: "-C target-feature=+crt-static -C target-cpu=x86-64-v3"
+
+          - os: windows-2022
             target: aarch64-pc-windows-msvc
-            artifact_name: region_converter-windows-arm64
+            artifact_name: region_converter-windows-arm64-compat
             binary_name: region_converter.exe
             build_tool: cargo build
             rustflags: "-C target-feature=+crt-static"
 
     env:
       CARGO_TERM_COLOR: always
+      CARGO_PROFILE_RELEASE_LTO: fat
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 1
+      CARGO_PROFILE_RELEASE_PANIC: abort
+      CARGO_PROFILE_RELEASE_STRIP: symbols
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
       - name: Install Linux compatibility toolchain
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.build_tool == 'cargo zigbuild'
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools python3-pip
